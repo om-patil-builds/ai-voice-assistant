@@ -23,7 +23,9 @@ const DEFAULT_WS_URL =
 
 export class SocketClient {
   constructor(url = DEFAULT_WS_URL) {
+    this.baseUrl = url;
     this.url = url;
+    this.sessionId = null;
     this.socket = null;
     this.listeners = new Map(); // eventType -> Set of callbacks
     this.statusListeners = new Set(); // connection status callbacks
@@ -34,6 +36,19 @@ export class SocketClient {
     this.isManuallyClosed = false;
 
     this.connectionState = 'disconnected'; // 'disconnected' | 'connecting' | 'connected' | 'error'
+  }
+
+  /**
+   * Set the session ID before connecting — embeds it in the WebSocket URL
+   * @param {string} sessionId
+   */
+  setSessionId(sessionId) {
+    this.sessionId = sessionId;
+    if (sessionId) {
+      this.url = `${this.baseUrl}?sessionId=${encodeURIComponent(sessionId)}`;
+    } else {
+      this.url = this.baseUrl;
+    }
   }
 
   /**
@@ -110,8 +125,19 @@ export class SocketClient {
       this.reconnectTimer = null;
     }
     if (this.socket) {
-      this.socket.close();
+      const sock = this.socket;
       this.socket = null;
+      if (sock.readyState === WebSocket.CONNECTING) {
+        sock.onopen = () => {
+          try {
+            sock.close();
+          } catch {
+            // ignore
+          }
+        };
+      } else if (sock.readyState === WebSocket.OPEN) {
+        sock.close();
+      }
     }
     this._setConnectionState('disconnected');
   }
@@ -224,15 +250,20 @@ export class SocketClient {
   /**
    * Convenience sender for continue
    * @param {Object} params
+   * @param {string} [params.turnId]
    * @param {string} params.sourceTurnId
    * @param {number} params.lastSpokenSegmentIndex
    */
-  continueTurn({ sourceTurnId, lastSpokenSegmentIndex }) {
-    return this.send({
+  continueTurn({ turnId, sourceTurnId, lastSpokenSegmentIndex }) {
+    const payload = {
       type: 'continue',
       sourceTurnId,
       lastSpokenSegmentIndex,
-    });
+    };
+    if (turnId) {
+      payload.turnId = turnId;
+    }
+    return this.send(payload);
   }
 
   /**

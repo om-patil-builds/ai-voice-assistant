@@ -14,6 +14,10 @@ export function App() {
     silenceTimeoutMs,
     pausedResponse,
     telemetry,
+    ttsVolume,
+    ttsRate,
+    voices,
+    selectedVoiceURI,
     audioLevel,
     isListening,
     isRecording,
@@ -23,10 +27,14 @@ export function App() {
     startTurnWithText,
     handleContinueResponse,
     handleRepeatLastResponse,
+    testAudioOutput,
     toggleMute,
     clearChat,
     stopSession,
     setSilenceTimeout,
+    setVolume,
+    setRate,
+    setVoice,
     dismissError,
   } = useVoiceSession();
 
@@ -46,11 +54,13 @@ export function App() {
     }
   };
 
+  // Replay a specific message text through the standard voice pipeline
+  // (respects current volume, rate, voice and mute settings)
   const handleRepeatMessageText = (text) => {
     if (text) {
-      window.speechSynthesis?.cancel();
-      const utterance = new SpeechSynthesisUtterance(text);
-      window.speechSynthesis?.speak(utterance);
+      handleRepeatLastResponse(text);
+    } else {
+      handleRepeatLastResponse();
     }
   };
 
@@ -103,12 +113,20 @@ export function App() {
           hasPermission={hasPermission}
           permissionError={permissionError}
           silenceTimeoutMs={silenceTimeoutMs}
+          ttsVolume={ttsVolume}
+          ttsRate={ttsRate}
+          voices={voices}
+          selectedVoiceURI={selectedVoiceURI}
           onToggleListening={toggleListening}
           onSendText={(text) => startTurnWithText(text, 'text')}
           onToggleMute={toggleMute}
           onClearChat={clearChat}
           onSetSilenceTimeout={setSilenceTimeout}
+          onSetVolume={setVolume}
+          onSetRate={setRate}
+          onSetVoice={setVoice}
           onQuickCommand={handleQuickCommand}
+          onTestAudio={testAudioOutput}
         />
       </main>
     </div>

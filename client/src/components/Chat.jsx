@@ -19,10 +19,10 @@ export function Chat({
   }, [messages, status]);
 
   const suggestions = [
-    'Explain how acoustic echo cancellation works',
-    'What are the key advantages of Web Audio API?',
-    'Tell me a short science fiction story',
-    'How do black holes distort spacetime?',
+    'MERN Stack',
+    'Explain MERN Stack and how its technologies work together',
+    'How do Express.js and Node.js handle REST APIs?',
+    'What are the advantages of MongoDB compared to SQL databases?',
   ];
 
   return (

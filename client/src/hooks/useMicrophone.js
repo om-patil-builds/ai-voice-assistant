@@ -3,16 +3,16 @@ import { VoiceActivityDetector } from '../audio/vad.js';
 
 /**
  * Custom hook for microphone management, permission state,
- * Web Audio VAD monitoring, and audio recording.
+ * Web Audio VAD monitoring, and continuous pre-roll WAV recording.
  *
  * @param {Object} options
- * @param {number} [options.silenceTimeoutMs=600] - End-of-speech silence duration
+ * @param {number} [options.silenceTimeoutMs=550] - End-of-speech silence duration
  * @param {function} [options.onSpeechStart] - Immediate trigger for barge-in
- * @param {function} [options.onUtteranceRecorded] - (blob, durationMs) => void
- * @param {function} [options.onError] - (error) => void
+ * @param {function(Blob, number): void} [options.onUtteranceRecorded] - (wavBlob, durationMs) => void
+ * @param {function(Error): void} [options.onError] - (error) => void
  */
 export function useMicrophone({
-  silenceTimeoutMs = 600,
+  silenceTimeoutMs = 550,
   onSpeechStart,
   onUtteranceRecorded,
   onError,
@@ -24,9 +24,7 @@ export function useMicrophone({
   const [permissionError, setPermissionError] = useState(null);
 
   const mediaStreamRef = useRef(null);
-  const mediaRecorderRef = useRef(null);
   const vadRef = useRef(null);
-  const recordedChunksRef = useRef([]);
   const speechDurationRef = useRef(0);
   const isSpeechActiveRef = useRef(false);
 
@@ -46,81 +44,32 @@ export function useMicrophone({
     typeof navigator !== 'undefined' &&
     Boolean(navigator.mediaDevices?.getUserMedia) &&
     typeof window !== 'undefined' &&
-    Boolean(window.MediaRecorder);
+    Boolean(window.AudioContext || window.webkitAudioContext);
 
   /**
-   * Start recording utterance when speech is detected
+   * Handle speech start from VAD (immediate barge-in)
    */
   const handleVADSpeechStart = useCallback(() => {
     isSpeechActiveRef.current = true;
     setIsRecording(true);
 
-    // Call speech start callback immediately for barge-in!
     if (onSpeechStartRef.current) {
       onSpeechStartRef.current();
-    }
-
-    if (!mediaStreamRef.current) return;
-
-    try {
-      recordedChunksRef.current = [];
-
-      // Determine supported mimeType
-      const mimeTypes = [
-        'audio/webm;codecs=opus',
-        'audio/webm',
-        'audio/ogg;codecs=opus',
-        'audio/mp4',
-        '',
-      ];
-      const selectedMime = mimeTypes.find((type) => !type || MediaRecorder.isTypeSupported(type)) || '';
-
-      const options = selectedMime ? { mimeType: selectedMime } : {};
-      const recorder = new MediaRecorder(mediaStreamRef.current, options);
-      mediaRecorderRef.current = recorder;
-
-      recorder.ondataavailable = (event) => {
-        if (event.data && event.data.size > 0) {
-          recordedChunksRef.current.push(event.data);
-        }
-      };
-
-      recorder.onerror = (e) => {
-        console.error('MediaRecorder error:', e);
-        if (onErrorRef.current) onErrorRef.current(e.error || new Error('Audio recording error'));
-      };
-
-      recorder.start(100); // collect in 100ms chunks
-    } catch (err) {
-      console.error('Failed to start MediaRecorder:', err);
-      if (onErrorRef.current) onErrorRef.current(err);
     }
   }, []);
 
   /**
-   * Stop recording utterance when silence is reached
+   * Handle complete recorded utterance from VAD
    */
-  const handleVADSpeechEnd = useCallback((durationMs) => {
+  const handleVADSpeechEnd = useCallback((durationMs, wavBlob) => {
     isSpeechActiveRef.current = false;
     setIsRecording(false);
     speechDurationRef.current = durationMs;
 
-    const recorder = mediaRecorderRef.current;
-    if (recorder && recorder.state !== 'inactive') {
-      recorder.onstop = () => {
-        const mimeType = recorder.mimeType || 'audio/webm';
-        const blob = new Blob(recordedChunksRef.current, { type: mimeType });
-        recordedChunksRef.current = [];
-
-        // Filter out accidental clicks/pops with negligible duration
-        if (durationMs > 200 && blob.size > 800) {
-          if (onUtteranceRecordedRef.current) {
-            onUtteranceRecordedRef.current(blob, durationMs);
-          }
-        }
-      };
-
-      recorder.stop();
+    if (wavBlob && wavBlob.size > 2000) {
+      if (onUtteranceRecordedRef.current) {
+        onUtteranceRecordedRef.current(wavBlob, durationMs);
+      }
     }
   }, []);
 
@@ -138,13 +87,12 @@ export function useMicrophone({
     try {
       setPermissionError(null);
 
-      // Acoustic echo cancellation & noise suppression
+      // Acoustic echo cancellation, noise suppression, and auto-gain
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
-          sampleRate: 48000,
           channelCount: 1,
         },
       });
@@ -152,7 +100,7 @@ export function useMicrophone({
       mediaStreamRef.current = stream;
       setHasPermission(true);
 
-      // Create or configure VAD
+      // Create or configure VAD with pre-roll WAV capture
       if (!vadRef.current) {
         vadRef.current = new VoiceActivityDetector({
           silenceTimeoutMs,
@@ -178,31 +126,24 @@ export function useMicrophone({
         message = 'Microphone permission was denied. Please allow microphone access in browser settings.';
       } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
         message = 'No microphone device was detected on your system.';
-      } else if (err.name === 'NotReadableError') {
+      } else if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
         message = 'Microphone is already in use by another application.';
       }
-      setHasPermission(false);
+
       setPermissionError(message);
+      setHasPermission(false);
+      setIsListening(false);
       if (onErrorRef.current) onErrorRef.current(new Error(message));
       return false;
     }
   }, [isSupported, silenceTimeoutMs, handleVADSpeechStart, handleVADSpeechEnd]);
 
   /**
-   * Stop listening and release microphone tracks
+   * Stop listening to the microphone
    */
   const stopListening = useCallback(() => {
     if (vadRef.current) {
       vadRef.current.stop();
-    }
-
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      try {
-        mediaRecorderRef.current.stop();
-      } catch {
-        // ignore
-      }
-      mediaRecorderRef.current = null;
     }
 
     if (mediaStreamRef.current) {
@@ -216,21 +157,18 @@ export function useMicrophone({
   }, []);
 
   /**
-   * Toggle listening state
+   * Notify VAD when assistant is speaking through speakers (echo ducking)
    */
-  const toggleListening = useCallback(async () => {
-    if (isListening) {
-      stopListening();
-      return false;
-    } else {
-      return await startListening();
+  const setPlaybackActive = useCallback((active) => {
+    if (vadRef.current) {
+      vadRef.current.setPlaybackActive(active);
     }
-  }, [isListening, startListening, stopListening]);
+  }, []);
 
   /**
-   * Update silence timeout dynamically (400ms - 1500ms)
+   * Dynamically adjust silence timeout (ms)
    */
-  const setSilenceTimeout = useCallback((ms) => {
+  const updateSilenceTimeout = useCallback((ms) => {
     if (vadRef.current) {
       vadRef.current.setSilenceTimeout(ms);
     }
@@ -239,16 +177,18 @@ export function useMicrophone({
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      stopListening();
       if (vadRef.current) {
         vadRef.current.destroy();
         vadRef.current = null;
       }
+      if (mediaStreamRef.current) {
+        mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+        mediaStreamRef.current = null;
+      }
     };
-  }, [stopListening]);
+  }, []);
 
   return {
-    isSupported,
     isListening,
     isRecording,
     audioLevel,
@@ -256,7 +196,7 @@ export function useMicrophone({
     permissionError,
     startListening,
     stopListening,
-    toggleListening,
-    setSilenceTimeout,
+    setPlaybackActive,
+    updateSilenceTimeout,
   };
 }

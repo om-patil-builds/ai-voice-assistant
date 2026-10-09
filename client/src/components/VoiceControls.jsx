@@ -2,7 +2,8 @@ import { useState } from 'react';
 
 /**
  * VoiceControls component provides microphone toggle, text input fallback,
- * mute, clear chat, quick voice commands, and configurable silence timeout.
+ * mute, clear chat, quick voice commands, configurable silence timeout,
+ * voice volume, and speech rate controls (spec requirements).
  */
 export function VoiceControls({
   isListening,
@@ -11,12 +12,20 @@ export function VoiceControls({
   isMuted,
   permissionError,
   silenceTimeoutMs = 600,
+  ttsVolume = 1.0,
+  ttsRate = 1.0,
+  voices = [],
+  selectedVoiceURI = '',
   onToggleListening,
   onSendText,
   onToggleMute,
   onClearChat,
   onSetSilenceTimeout,
+  onSetVolume,
+  onSetRate,
+  onSetVoice,
   onQuickCommand,
+  onTestAudio,
 }) {
   const [inputText, setInputText] = useState('');
   const [showSettings, setShowSettings] = useState(false);
@@ -84,15 +93,16 @@ export function VoiceControls({
           id="cmd-settings"
           className="cmd-pill btn-settings-toggle"
           onClick={() => setShowSettings(!showSettings)}
-          title="Configure VAD settings"
+          title="Configure voice settings"
         >
           ⚙️ Settings
         </button>
       </div>
 
-      {/* Settings Drawer (Configurable silence timeout 400-700ms) */}
+      {/* Settings Drawer (silence timeout, volume, speech rate) */}
       {showSettings && (
         <div id="vad-settings-panel" className="settings-panel">
+          {/* Silence Timeout */}
           <div className="settings-row">
             <label htmlFor="silence-timeout-slider" className="settings-label">
               End-of-Speech Silence Timeout: <strong>{silenceTimeoutMs}ms</strong>
@@ -115,6 +125,93 @@ export function VoiceControls({
               Spec target: 400–700ms. Shorter values respond faster; longer values prevent interruptions during pauses.
             </span>
           </div>
+
+          {/* Voice Volume */}
+          <div className="settings-row" style={{ marginTop: '0.65rem' }}>
+            <label htmlFor="volume-slider" className="settings-label">
+              Voice Volume: <strong>{Math.round(ttsVolume * 100)}%</strong>
+            </label>
+            <div className="slider-wrapper">
+              <span>0%</span>
+              <input
+                id="volume-slider"
+                type="range"
+                min="0"
+                max="1"
+                step="0.05"
+                value={ttsVolume}
+                onChange={(e) => onSetVolume && onSetVolume(Number(e.target.value))}
+                className="range-slider"
+                aria-label="Voice output volume"
+              />
+              <span>100%</span>
+            </div>
+          </div>
+
+          {/* Speech Rate */}
+          <div className="settings-row" style={{ marginTop: '0.65rem' }}>
+            <label htmlFor="rate-slider" className="settings-label">
+              Speech Rate: <strong>{Number(ttsRate).toFixed(1)}×</strong>
+            </label>
+            <div className="slider-wrapper">
+              <span>0.5×</span>
+              <input
+                id="rate-slider"
+                type="range"
+                min="0.5"
+                max="2.0"
+                step="0.1"
+                value={ttsRate}
+                onChange={(e) => onSetRate && onSetRate(Number(e.target.value))}
+                className="range-slider"
+                aria-label="Speech rate"
+              />
+              <span>2.0×</span>
+            </div>
+            <span className="settings-hint">
+              Adjust how fast the assistant speaks. 1.0× is normal speed.
+            </span>
+          </div>
+
+          {/* Natural Voice Selection */}
+          {voices && voices.length > 0 && (
+            <div className="settings-row" style={{ marginTop: '0.65rem' }}>
+              <label htmlFor="voice-select" className="settings-label">
+                Natural Voice: <strong>{voices.find((v) => v.voiceURI === selectedVoiceURI)?.name || 'Default'}</strong>
+              </label>
+              <select
+                id="voice-select"
+                className="settings-select"
+                value={selectedVoiceURI || ''}
+                onChange={(e) => onSetVoice && onSetVoice(e.target.value)}
+                aria-label="Select Assistant Voice"
+              >
+                {voices.map((v) => (
+                  <option key={v.voiceURI} value={v.voiceURI}>
+                    {v.name} ({v.lang})
+                  </option>
+                ))}
+              </select>
+              <span className="settings-hint">
+                Select from system and browser natural neural voices.
+              </span>
+            </div>
+          )}
+
+          {/* Test Audio Output */}
+          {onTestAudio && (
+            <div style={{ marginTop: '0.65rem' }}>
+              <button
+                id="test-audio-btn"
+                type="button"
+                className="cmd-pill"
+                onClick={onTestAudio}
+                title="Play a test phrase to verify audio output"
+              >
+                🔈 Test Audio Output
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -172,7 +269,7 @@ export function VoiceControls({
           </button>
         </form>
 
-        {/* Auxiliary Controls (Clear Chat & Mute) */}
+        {/* Auxiliary Controls (Clear Chat) */}
         <div className="aux-controls">
           <button
             id="clear-chat-btn"

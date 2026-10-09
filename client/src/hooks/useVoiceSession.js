@@ -4,6 +4,7 @@ import { apiClient } from '../services/apiClient.js';
 import { TTSPlayer } from '../audio/ttsPlayer.js';
 import { PlaybackCursor } from '../audio/playbackCursor.js';
 import { useMicrophone } from './useMicrophone.js';
+import { normalizeTechTerms } from '../services/techTermNormalizer.js';
 
 // State Machine States
 export const SESSION_STATES = {
@@ -53,6 +54,10 @@ export function useVoiceSession() {
   const [connectionStatus, setConnectionStatus] = useState('disconnected');
   const [silenceTimeoutMs, setSilenceTimeoutMs] = useState(600);
   const [pausedResponse, setPausedResponse] = useState(null);
+  const [ttsVolume, setTtsVolume] = useState(1.0);
+  const [ttsRate, setTtsRate] = useState(1.0);
+  const [voices, setVoices] = useState([]);
+  const [selectedVoiceURI, setSelectedVoiceURI] = useState('');
   const [telemetry, setTelemetry] = useState({
     sttLatencyMs: null,
     firstTokenLatencyMs: null,
@@ -80,7 +85,8 @@ export function useVoiceSession() {
   const sessionIdRef = useRef(null);
 
   /**
-   * Session ID management & persistence restore
+   * Session ID management & persistence restore.
+   * Session ID is set on socketClient BEFORE connecting to eliminate race condition.
    */
   useEffect(() => {
     let sid = localStorage.getItem('ai_voice_assistant_session_id');
@@ -89,6 +95,10 @@ export function useVoiceSession() {
       localStorage.setItem('ai_voice_assistant_session_id', sid);
     }
     sessionIdRef.current = sid;
+
+    // Configure session ID on the socket client BEFORE connecting
+    // so it's embedded in the WebSocket URL and no race condition can occur
+    socketClient.setSessionId(sid);
 
     // Restore session from MongoDB via API
     apiClient
@@ -122,7 +132,9 @@ export function useVoiceSession() {
 
     const isPlayingAudio = ttsPlayerRef.current && (ttsPlayerRef.current.isSpeaking || status === SESSION_STATES.SPEAKING);
 
-    if (isPlayingAudio || status === SESSION_STATES.THINKING || status === SESSION_STATES.TRANSCRIBING) {
+    // Only barge in if the assistant is actively speaking audio!
+    // Do NOT cancel during THINKING or TRANSCRIBING because normal user breaths or ambient noise would kill the generation.
+    if (isPlayingAudio) {
       const turnId = activeTurnIdRef.current;
 
       // 1. Instantly stop browser TTS audio playback
@@ -137,11 +149,11 @@ export function useVoiceSession() {
       );
       setPausedResponse({ ...savedPaused });
 
-      // 3. Mark last message as interrupted in UI
+      // 3. Mark last message as interrupted in UI (ONLY assistant message!)
       if (turnId) {
         setMessages((prev) =>
           prev.map((msg) =>
-            msg.turnId === turnId
+            msg.turnId === turnId && msg.sender === 'assistant'
               ? {
                   ...msg,
                   status: 'interrupted',
@@ -195,9 +207,6 @@ export function useVoiceSession() {
   }, []);
 
   /**
-   * Clear Chat
-   */
-  /**
    * Stop current voice/audio session and generation
    */
   const stopSession = () => {
@@ -214,7 +223,8 @@ export function useVoiceSession() {
   };
 
   /**
-   * Clear Chat
+   * Clear Chat — clears UI state AND notifies backend to clear session history.
+   * Without the backend call, messages would reappear on next page refresh.
    */
   const clearChat = () => {
     if (abortControllerRef.current) {
@@ -229,12 +239,28 @@ export function useVoiceSession() {
     currentStreamingTextRef.current = '';
     setStatus(SESSION_STATES.IDLE);
     setErrorMessage(null);
+
+    // Clear server-side session so refresh doesn't restore old messages
+    const sid = sessionIdRef.current;
+    if (sid) {
+      apiClient.clearSession(sid).catch((err) =>
+        console.warn('Failed to clear server session:', err.message)
+      );
+    }
   };
 
   /**
-   * Repeat last assistant response
+   * Repeat last assistant response or replay a specific message text
+   * @param {string} [text] - Optional specific text to replay
    */
-  const handleRepeatLastResponse = () => {
+  const handleRepeatLastResponse = (text) => {
+    if (text) {
+      ttsPlayerRef.current.resetForTurn('repeat');
+      setStatus(SESSION_STATES.SPEAKING);
+      ttsPlayerRef.current.enqueueSegment(text, 0, 'repeat');
+      return;
+    }
+
     const assistantMessages = messages.filter((m) => m.sender === 'assistant' && m.text);
     if (assistantMessages.length === 0) return;
 
@@ -268,10 +294,12 @@ export function useVoiceSession() {
         ttsPlayerRef.current.enqueueSegment(seg.text, seg.index, sourceTurnId);
       });
 
-      // Update message status in transcript
+      // Update message status in transcript (ONLY assistant message)
       setMessages((prev) =>
         prev.map((msg) =>
-          msg.turnId === sourceTurnId ? { ...msg, status: 'resumed' } : msg
+          msg.turnId === sourceTurnId && msg.sender === 'assistant'
+            ? { ...msg, status: 'resumed' }
+            : msg
         )
       );
 
@@ -285,9 +313,20 @@ export function useVoiceSession() {
       const newTurnId = 'turn_' + Math.random().toString(36).substring(2, 10);
       activeTurnIdRef.current = newTurnId;
       lastReceivedSeqRef.current = -1;
+      currentStreamingTextRef.current = paused.generatedText ? paused.generatedText + ' ' : '';
       setStatus(SESSION_STATES.THINKING);
 
+      // Update the interrupted assistant message to resumed/streaming with the new turnId
+      setMessages((prev) =>
+        prev.map((msg) =>
+          msg.turnId === sourceTurnId && msg.sender === 'assistant'
+            ? { ...msg, turnId: newTurnId, status: 'streaming', text: currentStreamingTextRef.current }
+            : msg
+        )
+      );
+
       socketClient.continueTurn({
+        turnId: newTurnId,
         sourceTurnId,
         lastSpokenSegmentIndex,
       });
@@ -295,7 +334,7 @@ export function useVoiceSession() {
       // If backend is offline or fallback, speak whatever unplayed segments exist
       if (remainingSegments.length > 0) {
         remainingSegments.forEach((seg) => {
-          ttsPlayerRef.current.enqueueSegment(seg.text, seg.index, sourceTurnId);
+          ttsPlayerRef.current.enqueueSegment(seg.text, seg.index, newTurnId);
         });
       }
     }
@@ -312,7 +351,7 @@ export function useVoiceSession() {
       abortControllerRef.current = null;
     }
 
-    const trimmedText = text.trim();
+    const trimmedText = normalizeTechTerms(text.trim());
     const newTurnId = 'turn_' + Math.random().toString(36).substring(2, 10);
     activeTurnIdRef.current = newTurnId;
     activeTurnSeqRef.current = 0;
@@ -343,7 +382,16 @@ export function useVoiceSession() {
       timestamp: Date.now(),
     };
 
-    setMessages((prev) => [...prev, userMessage, assistantMessage]);
+    // Mark any previous in-flight streaming assistant messages as interrupted
+    setMessages((prev) => [
+      ...prev.map((msg) =>
+        msg.sender === 'assistant' && msg.status === 'streaming'
+          ? { ...msg, status: 'interrupted' }
+          : msg
+      ),
+      userMessage,
+      assistantMessage,
+    ]);
     setStatus(SESSION_STATES.THINKING);
     setErrorMessage(null);
 
@@ -413,7 +461,7 @@ export function useVoiceSession() {
       abortControllerRef.current = controller;
 
       try {
-        const result = await apiClient.uploadAudio(blob, 'speech.webm', {
+        const result = await apiClient.uploadAudio(blob, 'speech.wav', {
           signal: controller.signal,
         });
         const transcript = result?.transcript?.trim();
@@ -427,15 +475,35 @@ export function useVoiceSession() {
           return;
         }
 
+        let normalizedTranscript = transcript.trim();
+        const clean = normalizedTranscript.replace(/[.,!?;:]+/g, '').trim().toLowerCase();
+
+        // Filter out Whisper hallucination artifacts from background noise or silence
+        const isHallucination =
+          ['thanks for watching', 'thank you for watching', 'subtitles by', 'viewers like you', 'subscribe to my channel', 'amara.org'].some((h) => clean.includes(h));
+
+        if (!clean || isHallucination) {
+          setStatus(SESSION_STATES.LISTENING);
+          return;
+        }
+
+        // Fix Whisper acoustic misclassification: if lone 'y' or 'y.' is transcribed when saying "Hey"
+        if (clean === 'y') {
+          normalizedTranscript = 'Hey';
+        }
+
+        // Normalize developer terms, frameworks, and accent misrecognitions
+        normalizedTranscript = normalizeTechTerms(normalizedTranscript);
+
         // Voice Command Parsing
-        const command = parseVoiceCommand(transcript);
+        const command = parseVoiceCommand(normalizedTranscript);
         if (command) {
           handleVoiceCommand(command);
           return;
         }
 
         // Ordinary speech utterance -> Start new turn
-        startTurnWithText(transcript, 'audio');
+        startTurnWithText(normalizedTranscript, 'audio');
       } catch (err) {
         if (err.name === 'AbortError') {
           // Interrupted by barge-in or user stop; do not transition to ERROR
@@ -467,6 +535,11 @@ export function useVoiceSession() {
     },
   });
 
+  // Keep VAD updated when assistant is actively speaking through speakers
+  useEffect(() => {
+    microphone.setPlaybackActive(status === SESSION_STATES.SPEAKING);
+  }, [status, microphone]);
+
   /**
    * Toggle Mute
    */
@@ -476,6 +549,72 @@ export function useVoiceSession() {
       ttsPlayerRef.current.setMute(next);
       return next;
     });
+  };
+
+  /**
+   * Set TTS volume (0.0 to 1.0)
+   */
+  const handleSetVolume = (vol) => {
+    const clamped = Math.max(0, Math.min(1, vol));
+    setTtsVolume(clamped);
+    ttsPlayerRef.current.setVolume(clamped);
+  };
+
+  /**
+   * Set TTS speech rate (0.5 to 2.0)
+   */
+  const handleSetRate = (rate) => {
+    const clamped = Math.max(0.5, Math.min(2.0, rate));
+    setTtsRate(clamped);
+    ttsPlayerRef.current.setRate(clamped);
+  };
+
+  /**
+   * Synchronize browser speech synthesis voices
+   */
+  useEffect(() => {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+
+    const syncVoices = () => {
+      const available = window.speechSynthesis.getVoices() || [];
+      if (available.length > 0) {
+        const voiceList = available.map((v) => ({
+          name: v.name,
+          lang: v.lang,
+          voiceURI: v.voiceURI,
+          default: v.default,
+        }));
+        setVoices(voiceList);
+
+        const savedURI = localStorage.getItem('ai_voice_assistant_voice_uri');
+        if (savedURI && available.some((v) => v.voiceURI === savedURI)) {
+          setSelectedVoiceURI(savedURI);
+          ttsPlayerRef.current?.setVoice(savedURI);
+        } else if (ttsPlayerRef.current?.selectedVoice) {
+          setSelectedVoiceURI(ttsPlayerRef.current.selectedVoice.voiceURI);
+        }
+      }
+    };
+
+    syncVoices();
+    if (typeof window.speechSynthesis.addEventListener === 'function') {
+      window.speechSynthesis.addEventListener('voiceschanged', syncVoices);
+      return () => window.speechSynthesis.removeEventListener('voiceschanged', syncVoices);
+    } else {
+      window.speechSynthesis.onvoiceschanged = syncVoices;
+      return () => {
+        window.speechSynthesis.onvoiceschanged = null;
+      };
+    }
+  }, []);
+
+  /**
+   * Select a specific natural voice by URI
+   */
+  const handleSetVoice = (voiceURI) => {
+    setSelectedVoiceURI(voiceURI);
+    localStorage.setItem('ai_voice_assistant_voice_uri', voiceURI);
+    ttsPlayerRef.current?.setVoice(voiceURI);
   };
 
   /**
@@ -513,10 +652,12 @@ export function useVoiceSession() {
       // Feed delta to TTS player for sentence chunking
       ttsPlayerRef.current.feedDelta(delta, turnId, false);
 
-      // Update message bubble in UI
+      // Update message bubble in UI (ONLY assistant message!)
       setMessages((prev) =>
         prev.map((msg) =>
-          msg.turnId === turnId ? { ...msg, text: currentStreamingTextRef.current } : msg
+          msg.turnId === turnId && msg.sender === 'assistant'
+            ? { ...msg, text: currentStreamingTextRef.current }
+            : msg
         )
       );
     });
@@ -532,11 +673,28 @@ export function useVoiceSession() {
     const unsubUserTranscript = socketClient.on('user_transcript', (data) => {
       const { turnId, text } = data;
       if (!turnId || !text) return;
-      setMessages((prev) =>
-        prev.map((msg) =>
-          msg.turnId === turnId && msg.sender === 'user' ? { ...msg, text } : msg
-        )
-      );
+      setMessages((prev) => {
+        const hasUserMsg = prev.some((msg) => msg.turnId === turnId && msg.sender === 'user');
+        if (hasUserMsg) {
+          return prev.map((msg) =>
+            msg.turnId === turnId && msg.sender === 'user' ? { ...msg, text } : msg
+          );
+        }
+        const userMsg = {
+          id: 'msg_' + Math.random().toString(36).substring(2, 9),
+          sender: 'user',
+          text,
+          turnId,
+          timestamp: Date.now(),
+        };
+        const assistantIdx = prev.findIndex((msg) => msg.turnId === turnId && msg.sender === 'assistant');
+        if (assistantIdx !== -1) {
+          const next = [...prev];
+          next.splice(assistantIdx, 0, userMsg);
+          return next;
+        }
+        return [...prev, userMsg];
+      });
     });
 
     // Handle turn complete
@@ -547,9 +705,12 @@ export function useVoiceSession() {
       ttsPlayerRef.current.feedDelta('', turnId, true);
       playbackCursorRef.current.markGenerationComplete();
 
+      // Only mark assistant message as completed
       setMessages((prev) =>
         prev.map((msg) =>
-          msg.turnId === turnId ? { ...msg, status: 'completed' } : msg
+          msg.turnId === turnId && msg.sender === 'assistant'
+            ? { ...msg, status: 'completed' }
+            : msg
         )
       );
     });
@@ -565,6 +726,16 @@ export function useVoiceSession() {
     const unsubError = socketClient.on('error', (data) => {
       setErrorMessage(data.message || 'An error occurred during voice session.');
       setStatus(SESSION_STATES.ERROR);
+      if (activeTurnIdRef.current) {
+        const currentActiveId = activeTurnIdRef.current;
+        setMessages((prev) =>
+          prev.map((msg) =>
+            msg.turnId === currentActiveId && msg.sender === 'assistant'
+              ? { ...msg, status: 'error' }
+              : msg
+          )
+        );
+      }
     });
 
     return () => {
@@ -603,6 +774,13 @@ export function useVoiceSession() {
     microphone.setSilenceTimeout(ms);
   };
 
+  /**
+   * Directly test TTS audio playback
+   */
+  const testAudioOutput = () => {
+    return ttsPlayerRef.current?.testVoice('Hello! Voice assistant audio is working properly.');
+  };
+
   return {
     status,
     messages,
@@ -612,6 +790,10 @@ export function useVoiceSession() {
     silenceTimeoutMs,
     pausedResponse,
     telemetry,
+    ttsVolume,
+    ttsRate,
+    voices,
+    selectedVoiceURI,
     audioLevel: microphone.audioLevel,
     isListening: microphone.isListening,
     isRecording: microphone.isRecording,
@@ -621,10 +803,15 @@ export function useVoiceSession() {
     startTurnWithText,
     handleContinueResponse,
     handleRepeatLastResponse,
+    handleRepeatResponse: handleRepeatLastResponse,
+    testAudioOutput,
     toggleMute,
     clearChat,
     stopSession,
     setSilenceTimeout: handleSetSilenceTimeout,
+    setVolume: handleSetVolume,
+    setRate: handleSetRate,
+    setVoice: handleSetVoice,
     dismissError: () => setErrorMessage(null),
   };
 }

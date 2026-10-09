@@ -29,6 +29,7 @@ export class TTSPlayer {
 
     this.rate = 1.0;
     this.pitch = 1.0;
+    this.volume = 1.0;
     this.selectedVoice = null;
 
     // Stream buffer for feeding LLM tokens
@@ -43,9 +44,15 @@ export class TTSPlayer {
 
     if (this.isSupported) {
       // Warm up voices
-      window.speechSynthesis.onvoiceschanged = () => {
-        this._loadPreferredVoice();
-      };
+      if (typeof window.speechSynthesis.addEventListener === 'function') {
+        window.speechSynthesis.addEventListener('voiceschanged', () => {
+          this._loadPreferredVoice();
+        });
+      } else {
+        window.speechSynthesis.onvoiceschanged = () => {
+          this._loadPreferredVoice();
+        };
+      }
       this._loadPreferredVoice();
     }
   }
@@ -53,13 +60,55 @@ export class TTSPlayer {
   _loadPreferredVoice() {
     if (!this.isSupported) return;
     const voices = window.speechSynthesis.getVoices();
-    // Prioritize natural English voices (Google US English, Samantha, Microsoft Jenny, etc.)
-    const preferred = voices.find(
-      (v) =>
-        (v.lang.startsWith('en') && (v.name.includes('Natural') || v.name.includes('Google') || v.name.includes('Premium'))) ||
-        (v.lang.startsWith('en-US'))
-    );
-    this.selectedVoice = preferred || voices.find((v) => v.lang.startsWith('en')) || voices[0] || null;
+    if (!voices || voices.length === 0) return;
+
+    // If user already chose a valid voice, keep it
+    if (this.selectedVoice && voices.some((v) => v.voiceURI === this.selectedVoice.voiceURI)) {
+      return;
+    }
+
+    // Prioritize natural/neural English voices
+    const preferred =
+      voices.find(
+        (v) =>
+          v.lang.startsWith('en') &&
+          (v.name.includes('Natural') ||
+            v.name.includes('Online') ||
+            v.name.includes('Google') ||
+            v.name.includes('Jenny') ||
+            v.name.includes('David') ||
+            v.name.includes('Zira') ||
+            v.name.includes('Premium'))
+      ) ||
+      voices.find((v) => v.lang.startsWith('en-US')) ||
+      voices.find((v) => v.lang.startsWith('en')) ||
+      voices[0];
+
+    if (preferred) {
+      this.selectedVoice = preferred;
+    }
+  }
+
+  /**
+   * Get available voices from browser
+   * @returns {SpeechSynthesisVoice[]}
+   */
+  getVoices() {
+    if (!this.isSupported) return [];
+    return window.speechSynthesis.getVoices() || [];
+  }
+
+  /**
+   * Set specific voice by URI or Name
+   * @param {string} voiceURI
+   */
+  setVoice(voiceURI) {
+    if (!this.isSupported || !voiceURI) return;
+    const voices = window.speechSynthesis.getVoices() || [];
+    const match = voices.find((v) => v.voiceURI === voiceURI || v.name === voiceURI);
+    if (match) {
+      this.selectedVoice = match;
+    }
   }
 
   /**
@@ -71,6 +120,22 @@ export class TTSPlayer {
     if (this.isMuted && this.isSpeaking) {
       this.cancel();
     }
+  }
+
+  /**
+   * Set speech volume (0.0 to 1.0)
+   * @param {number} vol
+   */
+  setVolume(vol) {
+    this.volume = Math.max(0, Math.min(1, vol));
+  }
+
+  /**
+   * Set speech rate (0.5 to 2.0)
+   * @param {number} rate
+   */
+  setRate(rate) {
+    this.rate = Math.max(0.5, Math.min(2.0, rate));
   }
 
   /**
@@ -185,10 +250,18 @@ export class TTSPlayer {
     this.cancelled = false;
 
     try {
+      if (!this.selectedVoice) {
+        this._loadPreferredVoice();
+      }
+
       const utterance = new SpeechSynthesisUtterance(seg.text);
       if (this.selectedVoice) {
         utterance.voice = this.selectedVoice;
+        utterance.lang = this.selectedVoice.lang || 'en-US';
+      } else {
+        utterance.lang = 'en-US';
       }
+      utterance.volume = this.volume;
       utterance.rate = this.rate;
       utterance.pitch = this.pitch;
 
@@ -214,10 +287,16 @@ export class TTSPlayer {
         if (this.cancelled) return;
         // 'interrupted' or 'canceled' are standard when cancel() is called
         if (e.error !== 'interrupted' && e.error !== 'canceled') {
+          console.warn('TTS utterance error:', e.error);
           this.onError(e);
         }
         this._playNext();
       };
+
+      // Chrome Windows Bug: speechSynthesis can get paused/stuck
+      if (window.speechSynthesis.paused) {
+        window.speechSynthesis.resume();
+      }
 
       window.speechSynthesis.speak(utterance);
     } catch (err) {
@@ -258,9 +337,38 @@ export class TTSPlayer {
   }
 
   /**
-   * Get confirmed spoken index
+   * Speak a test phrase directly to verify audio output
+   * @param {string} text
+   * @returns {boolean}
    */
-  getLastSpokenSegmentIndex() {
-    return this.lastConfirmedSegmentIndex;
+  testVoice(text = 'Hello! Your voice assistant audio is working loud and clear.') {
+    if (!this.isSupported) return false;
+    this.cancel();
+    if (window.speechSynthesis.paused) {
+      window.speechSynthesis.resume();
+    }
+    if (!this.selectedVoice) {
+      this._loadPreferredVoice();
+    }
+    const utterance = new SpeechSynthesisUtterance(text);
+    if (this.selectedVoice) {
+      utterance.voice = this.selectedVoice;
+      utterance.lang = this.selectedVoice.lang || 'en-US';
+    } else {
+      utterance.lang = 'en-US';
+    }
+    utterance.volume = this.volume;
+    utterance.rate = this.rate;
+    utterance.pitch = this.pitch;
+    this._retainedUtterance = utterance;
+    utterance.onend = () => {
+      this._retainedUtterance = null;
+    };
+    utterance.onerror = (e) => {
+      this._retainedUtterance = null;
+      console.warn('testVoice error:', e);
+    };
+    window.speechSynthesis.speak(utterance);
+    return true;
   }
 }

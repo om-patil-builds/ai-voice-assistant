@@ -109,6 +109,22 @@ export class ApiClient {
       return null;
     }
   }
+  /**
+   * Clear session history on the server (DELETE /api/sessions/:id)
+   * Called by clearChat to prevent old messages from reappearing on refresh.
+   * @param {string} sessionId
+   * @returns {Promise<void>}
+   */
+  async clearSession(sessionId) {
+    if (!sessionId) return;
+    try {
+      await fetch(`${this.baseUrl}/api/sessions/${encodeURIComponent(sessionId)}`, {
+        method: 'DELETE',
+      });
+    } catch (err) {
+      console.warn(`Could not clear server session: ${err.message}`);
+    }
+  }
 }
 
 export const apiClient = new ApiClient();
