@@ -1,6 +1,7 @@
 import { SessionController } from './sessionController.js';
 import { parseVoiceCommand, COMMANDS } from './commandParser.js';
 import { normalizeTechTerms } from './techTermNormalizer.js';
+import { detectLanguage } from './languageDetector.js';
 import { streamChatCompletion, streamContinuationCompletion } from '../../providers/groqLlm.js';
 import { logger } from '../../lib/logger.js';
 
@@ -42,12 +43,14 @@ export class TurnManager {
    * @param {string} params.turnId
    * @param {number} [params.seq=0]
    * @param {string} params.text
+   * @param {string} [params.language]
    * @param {'text'|'audio'} [params.inputType='text']
    * @param {function(Object): void} params.sendEvent
    */
-  async startTurn({ sessionId, turnId, text, inputType = 'text', sendEvent }) {
+  async startTurn({ sessionId, turnId, text, inputType = 'text', language, sendEvent }) {
     if (!text || !text.trim()) return;
     const cleanText = normalizeTechTerms(text.trim());
+    const detectedLang = detectLanguage(cleanText, language);
 
     // 1. Abort any previous active turn
     this.abortActiveTurn(sessionId);
@@ -59,6 +62,7 @@ export class TurnManager {
       sessionId,
       inputType,
       text: cleanText,
+      language: detectedLang,
       abortController,
       seq: 0,
       nextSegmentIndex: 0,
@@ -76,6 +80,7 @@ export class TurnManager {
       type: 'user_transcript',
       turnId,
       text: cleanText,
+      language: detectedLang,
       isFinal: true,
     });
 
@@ -104,7 +109,8 @@ export class TurnManager {
       });
 
       let streamBuffer = '';
-      const sentenceRegex = /([.!?\n]+)\s+/g;
+      // Support standard punctuation as well as Devanagari Purna Viram (\u0964, \u0965)
+      const sentenceRegex = /([.!?\n\u0964\u0965]+)\s+/g;
 
       for await (const delta of tokenStream) {
         if (abortController.signal.aborted || turnState.isAborted) {
@@ -121,6 +127,7 @@ export class TurnManager {
           turnId,
           seq: turnState.seq++,
           delta,
+          language: detectedLang,
         });
 
         // Sentence chunking for TTS segment queue
@@ -140,6 +147,7 @@ export class TurnManager {
               turnId,
               segmentIndex: segment.index,
               text: segment.text,
+              language: detectedLang,
             });
           }
         }
@@ -163,6 +171,7 @@ export class TurnManager {
           turnId,
           segmentIndex: finalSegment.index,
           text: finalSegment.text,
+          language: detectedLang,
         });
       }
 
@@ -170,6 +179,7 @@ export class TurnManager {
       sendEvent({
         type: 'turn_complete',
         turnId,
+        language: detectedLang,
       });
 
       await SessionController.saveAssistantMessage(
@@ -184,6 +194,7 @@ export class TurnManager {
       await SessionController.updatePausedResponse(sessionId, {
         sourceTurnId: turnId,
         generatedText: turnState.generatedText,
+        language: detectedLang,
         lastSpokenSegmentIndex: turnState.nextSegmentIndex - 1,
         generationComplete: true,
         segments: turnState.segments,
@@ -244,6 +255,7 @@ export class TurnManager {
     const pausedState = {
       sourceTurnId: sourceId,
       generatedText: interruptedText,
+      language: activeTurn?.language || detectLanguage(interruptedText),
       lastSpokenSegmentIndex: -1,
       generationComplete: false,
       segments,
@@ -295,6 +307,7 @@ export class TurnManager {
 
     // Update confirmed spoken index
     paused.lastSpokenSegmentIndex = lastSpokenSegmentIndex;
+    const continuationLanguage = paused.language || detectLanguage(paused.generatedText) || 'en';
 
     const remainingSegments = (paused.segments || []).filter(
       (s) => s.index > lastSpokenSegmentIndex
@@ -310,12 +323,14 @@ export class TurnManager {
           turnId: paused.sourceTurnId || sourceTurnId,
           segmentIndex: seg.index,
           text: seg.text,
+          language: continuationLanguage,
         });
       }
 
       sendEvent({
         type: 'turn_complete',
         turnId: paused.sourceTurnId || sourceTurnId,
+        language: continuationLanguage,
       });
 
       await SessionController.updateStatus(sessionId, 'LISTENING');
@@ -331,6 +346,7 @@ export class TurnManager {
       sessionId,
       inputType: 'text',
       text: 'continue',
+      language: continuationLanguage,
       abortController,
       seq: 0,
       nextSegmentIndex: Math.max(0, lastSpokenSegmentIndex + 1),
@@ -347,11 +363,12 @@ export class TurnManager {
       const tokenStream = streamContinuationCompletion({
         conversationHistory: history,
         generatedTextPrefix: paused.generatedText,
+        language: continuationLanguage,
         signal: abortController.signal,
       });
 
       let streamBuffer = '';
-      const sentenceRegex = /([.!?\n]+)\s+/g;
+      const sentenceRegex = /([.!?\n\u0964\u0965]+)\s+/g;
 
       for await (const delta of tokenStream) {
         if (abortController.signal.aborted || turnState.isAborted) {
@@ -385,6 +402,7 @@ export class TurnManager {
               turnId: continuationTurnId,
               segmentIndex: segment.index,
               text: segment.text,
+              language: continuationLanguage,
             });
           }
         }
@@ -404,12 +422,14 @@ export class TurnManager {
           turnId: continuationTurnId,
           segmentIndex: finalSegment.index,
           text: finalSegment.text,
+          language: continuationLanguage,
         });
       }
 
       sendEvent({
         type: 'turn_complete',
         turnId: continuationTurnId,
+        language: continuationLanguage,
       });
 
       const fullCombinedText = paused.generatedText
@@ -428,6 +448,7 @@ export class TurnManager {
       await SessionController.updatePausedResponse(sessionId, {
         sourceTurnId: continuationTurnId,
         generatedText: fullCombinedText,
+        language: continuationLanguage,
         lastSpokenSegmentIndex: turnState.nextSegmentIndex - 1,
         generationComplete: true,
         segments: [...(paused.segments || []), ...turnState.segments],

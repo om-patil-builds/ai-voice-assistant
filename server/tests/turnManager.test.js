@@ -121,3 +121,46 @@ test('TurnManager - startTurn emits user_transcript event with correct payload',
   assert.equal(userMsg.text, 'My name is Om Patil.');
   assert.equal(userMsg.sender, 'user');
 });
+
+test('TurnManager - multilingual Marathi and Hindi command parsing and language detection', async () => {
+  const turnManager = new TurnManager();
+  const sessionId = 'test_multi_turn_' + Date.now();
+  await SessionController.getOrCreateSession(sessionId);
+
+  // 1. Marathi stop command
+  const marathiEvents = [];
+  await turnManager.startTurn({
+    sessionId,
+    turnId: 'turn_mr_stop',
+    text: 'थांबा',
+    inputType: 'audio',
+    sendEvent: (ev) => marathiEvents.push(ev),
+  });
+
+  const mrTranscript = marathiEvents.find((e) => e.type === 'user_transcript');
+  assert.ok(mrTranscript, 'Should emit user_transcript for Marathi turn');
+  assert.equal(mrTranscript.language, 'mr');
+  assert.equal(mrTranscript.text, 'थांबा');
+
+  const mrStopStatus = marathiEvents.find((e) => e.type === 'status' && e.state === 'IDLE');
+  assert.ok(mrStopStatus, 'Should transition to IDLE on Marathi stop command (थांबा)');
+
+  // 2. Hindi stop command
+  const hindiEvents = [];
+  await turnManager.startTurn({
+    sessionId,
+    turnId: 'turn_hi_stop',
+    text: 'रुको',
+    inputType: 'audio',
+    sendEvent: (ev) => hindiEvents.push(ev),
+  });
+
+  const hiTranscript = hindiEvents.find((e) => e.type === 'user_transcript');
+  assert.ok(hiTranscript, 'Should emit user_transcript for Hindi turn');
+  assert.equal(hiTranscript.language, 'hi');
+  assert.equal(hiTranscript.text, 'रुको');
+
+  const hiStopStatus = hindiEvents.find((e) => e.type === 'status' && e.state === 'IDLE');
+  assert.ok(hiStopStatus, 'Should transition to IDLE on Hindi stop command (रुको)');
+});
+

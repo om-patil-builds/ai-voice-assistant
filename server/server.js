@@ -6,6 +6,7 @@ import { config } from './src/lib/config.js';
 import { logger } from './src/lib/logger.js';
 import transcriptionsRouter from './src/routes/transcriptions.js';
 import sessionsRouter from './src/routes/sessions.js';
+import ttsRouter from './src/routes/tts.js';
 import { initVoiceGateway } from './src/ws/voiceGateway.js';
 
 const app = express();
@@ -57,6 +58,7 @@ app.get('/health', (req, res) => {
 // REST API Routes
 app.use('/api/transcriptions', transcriptionsRouter);
 app.use('/api/sessions', sessionsRouter);
+app.use('/api/tts', ttsRouter);
 
 // Global Error Handler
 app.use((err, req, res, next) => {

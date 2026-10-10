@@ -4,6 +4,8 @@ import { logger } from '../lib/logger.js';
 import { ValidationError, RateLimitError, STTError, AppError } from '../lib/errors.js';
 import { normalizeTechTerms } from '../modules/voice/techTermNormalizer.js';
 
+import { normalizeLanguageCode } from '../modules/voice/languageDetector.js';
+
 let groqClient = null;
 
 function getGroqClient() {
@@ -21,13 +23,35 @@ function getGroqClient() {
 }
 
 /**
- * Contextual prompt for Whisper STT biasing.
- * Priming Whisper with domain vocabulary ensures short greetings ("Hey", "Hello")
- * are not acoustically misclassified as single letters ("Y"), and voice commands
- * are recognized with high precision.
+ * Sanitizes prompt to ensure it strictly stays under Groq Whisper's 896-byte limit.
+ * Multi-byte UTF-8 characters (like Devanagari) can expand beyond string length, so
+ * we measure and clamp by UTF-8 byte length with a safety margin (800 bytes).
+ *
+ * @param {string} prompt
+ * @param {number} maxBytes
+ * @returns {string|undefined}
  */
-const STT_VOCABULARY_PROMPT =
-  'Conversational English voice assistant discussing software engineering, coding, and web development. Accurately transcribes technical terms, frameworks, stacks, and programming languages even with diverse global and Indian accents: MERN stack (MongoDB, Express.js, React.js, Node.js), MEAN stack, LAMP stack, JavaScript, TypeScript, REST API, GraphQL, full-stack, frontend, backend, SQL, NoSQL, Git, GitHub, Docker, Kubernetes, JSON, npm, Next.js, Redux, HTML, CSS, Python. Clear voice commands: Hey, Hello, Hi, Stop, Continue, Repeat that, Mute, Unmute, Clear chat, Thank you.';
+export function sanitizeSttPrompt(prompt, maxBytes = 800) {
+  if (!prompt || typeof prompt !== 'string') return undefined;
+  if (Buffer.byteLength(prompt, 'utf8') <= maxBytes) return prompt;
+
+  let truncated = prompt;
+  while (Buffer.byteLength(truncated, 'utf8') > maxBytes && truncated.length > 0) {
+    truncated = truncated.slice(0, -5);
+  }
+  return truncated.trim();
+}
+
+/**
+ * Contextual prompt for Whisper STT multilingual biasing.
+ * Priming Whisper with English, Hindi, and Marathi vocabulary ensures high accuracy
+ * across all three languages and mixed speech (Hinglish/Maranglish), and voice commands.
+ * Kept well under Groq's 896 UTF-8 byte limit (~480 bytes).
+ */
+export const STT_VOCABULARY_PROMPT = sanitizeSttPrompt(
+  'MERN stack, MongoDB, Express.js, React.js, Node.js, JavaScript, TypeScript, REST API, GraphQL, full-stack. हिंदी/मराठी: नमस्ते, नमस्कार, मर्न स्टॅक, मर्न स्टैक, क्या है, म्हणजे काय, रुको, थांबा, आगे बोलो, पुढे बोला, फिर से बोलो, पुन्हा सांगा. Commands: Stop, Continue, Repeat, Mute.'
+);
+
 
 /**
  * Check if a 16-bit PCM WAV buffer is pure silence or low-energy ambient noise
@@ -66,6 +90,7 @@ function analyzeWavEnergy(buffer) {
 
 /**
  * Transcribe audio buffer using Groq Whisper STT (whisper-large-v3-turbo)
+ * Supports automatic language detection for English, Marathi, and Hindi.
  *
  * @param {Buffer} audioBuffer
  * @param {Object} [options]
@@ -95,7 +120,7 @@ export async function transcribeAudio(audioBuffer, options = {}) {
     return {
       transcript: '',
       duration: 0,
-      language: config.groqSttLanguage || 'en',
+      language: config.groqSttLanguage ? normalizeLanguageCode(config.groqSttLanguage) : 'en',
     };
   }
 
@@ -105,19 +130,22 @@ export async function transcribeAudio(audioBuffer, options = {}) {
     const file = await toFile(audioBuffer, filename, { type: mimetype });
 
     const startTime = Date.now();
-    const response = await client.audio.transcriptions.create(
-      {
-        file,
-        model: config.groqSttModel,
-        language: config.groqSttLanguage || 'en', // Strict English lock eliminates foreign hallucinations
-        prompt: STT_VOCABULARY_PROMPT,
-        response_format: 'verbose_json',
-        temperature: 0.0,
-      },
-      {
-        signal: options.signal,
-      }
-    );
+    const transcriptionParams = {
+      file,
+      model: config.groqSttModel,
+      prompt: sanitizeSttPrompt(options.prompt || STT_VOCABULARY_PROMPT),
+      response_format: 'verbose_json',
+      temperature: 0.0,
+    };
+
+    // If language is explicitly forced via config, use it; otherwise allow automatic language detection
+    if (config.groqSttLanguage && config.groqSttLanguage !== 'auto') {
+      transcriptionParams.language = config.groqSttLanguage;
+    }
+
+    const response = await client.audio.transcriptions.create(transcriptionParams, {
+      signal: options.signal,
+    });
 
     const elapsedMs = Date.now() - startTime;
     let rawText = (response.text || '').trim();
@@ -143,16 +171,18 @@ export async function transcribeAudio(audioBuffer, options = {}) {
       rawText = normalizeTechTerms(rawText);
     }
 
+    const detectedLang = normalizeLanguageCode(response.language || config.groqSttLanguage || 'en');
+
     logger.info(`STT transcription succeeded in ${elapsedMs}ms`, {
       duration: response.duration,
       transcript: rawText,
-      language: response.language,
+      language: detectedLang,
     });
 
     return {
       transcript: rawText,
       duration: response.duration,
-      language: response.language || config.groqSttLanguage || 'en',
+      language: detectedLang,
     };
   } catch (err) {
     if (

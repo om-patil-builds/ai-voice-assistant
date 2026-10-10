@@ -97,12 +97,31 @@ test('TechTermNormalizer - normalizes developer ecosystem and architectures', ()
   assert.equal(normalizeTechTerms('front end and back end'), 'frontend and backend');
 });
 
+test('TechTermNormalizer - normalizes Devanagari tech terms in Marathi and Hindi', () => {
+  assert.equal(normalizeTechTerms('मर्न स्टॅक म्हणजे काय?'), 'MERN Stack म्हणजे काय?');
+  assert.equal(normalizeTechTerms('मर्न स्टैक क्या है?'), 'MERN Stack क्या है?');
+  assert.equal(normalizeTechTerms('मोंगो डीबी बद्दल माहिती सांगा'), 'MongoDB बद्दल माहिती सांगा');
+  assert.equal(normalizeTechTerms('मोंगो डीबी के बारे में बताओ'), 'MongoDB के बारे में बताओ');
+  assert.equal(normalizeTechTerms('एक्सप्रेस जेएस वापरा'), 'Express.js वापरा');
+  assert.equal(normalizeTechTerms('रिएक्ट जेएस शिका'), 'React.js शिका');
+  assert.equal(normalizeTechTerms('नोड जेएस सर्वर'), 'Node.js सर्वर');
+  assert.equal(normalizeTechTerms('जावास्क्रिप्ट आणि टाइपस्क्रिप्ट'), 'JavaScript आणि TypeScript');
+  assert.equal(normalizeTechTerms('रेस्ट एपीआई बनवा'), 'REST API बनवा');
+  assert.equal(normalizeTechTerms('एपीआई कॉल करा'), 'API कॉल करा');
+});
+
 test('TechTermNormalizer - correctly identifies technical term queries', () => {
   assert.equal(isTechnicalTermQuery('MERN Stack'), true);
   assert.equal(isTechnicalTermQuery('mern'), true);
   assert.equal(isTechnicalTermQuery('Tell me about mongodb'), true);
   assert.equal(isTechnicalTermQuery('How does react.js work?'), true);
+  assert.equal(isTechnicalTermQuery('मर्न स्टॅक म्हणजे काय?'), true);
+  assert.equal(isTechnicalTermQuery('रिएक्ट जेएस क्या है?'), true);
+  assert.equal(isTechnicalTermQuery('मोंगो डीबी माहिती'), true);
   assert.equal(isTechnicalTermQuery('Good morning, how are you today?'), false);
+  assert.equal(isTechnicalTermQuery('शुभ सकाळ, कसे आहात?'), false);
+  assert.equal(isTechnicalTermQuery('नमस्ते, आप कैसे हैं?'), false);
   assert.equal(isTechnicalTermQuery(''), false);
   assert.equal(isTechnicalTermQuery(null), false);
 });
+

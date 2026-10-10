@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { transcribeAudio } from '../src/providers/groqStt.js';
+import { transcribeAudio, STT_VOCABULARY_PROMPT, sanitizeSttPrompt } from '../src/providers/groqStt.js';
 import { streamChatCompletion, streamContinuationCompletion } from '../src/providers/groqLlm.js';
 import { ValidationError, AppError } from '../src/lib/errors.js';
 
@@ -17,6 +17,20 @@ test('Groq STT Provider - validates empty and oversized buffers', async () => {
     (err) => err instanceof ValidationError
   );
 });
+
+test('Groq STT Provider - vocabulary prompt strictly conforms to Groq 896-byte limit', () => {
+  const byteLength = Buffer.byteLength(STT_VOCABULARY_PROMPT, 'utf8');
+  assert.ok(
+    byteLength <= 800,
+    `STT_VOCABULARY_PROMPT UTF-8 bytes must be <= 800 (Groq limit is 896), got ${byteLength}`
+  );
+
+  // Verify sanitizeSttPrompt clamps oversized inputs
+  const oversizedText = 'मर्न स्टॅक म्हणजे काय? '.repeat(60);
+  const sanitized = sanitizeSttPrompt(oversizedText, 800);
+  assert.ok(Buffer.byteLength(sanitized, 'utf8') <= 800);
+});
+
 
 test('Groq LLM Provider - abort controller terminates stream generator immediately', async () => {
   const controller = new AbortController();

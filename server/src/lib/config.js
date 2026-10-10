@@ -15,7 +15,7 @@ export const config = {
   groqApiKey: process.env.GROQ_API_KEY || '',
   groqModel: process.env.GROQ_MODEL || 'openai/gpt-oss-20b',
   groqSttModel: process.env.GROQ_STT_MODEL || 'whisper-large-v3-turbo',
-  groqSttLanguage: process.env.GROQ_STT_LANGUAGE || 'en',
+  groqSttLanguage: process.env.GROQ_STT_LANGUAGE || null,
   maxAudioSizeMb: parseInt(process.env.MAX_AUDIO_SIZE_MB || '25', 10),
   rateLimitWindowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10), // 1 minute
   rateLimitMaxRequests: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '60', 10),

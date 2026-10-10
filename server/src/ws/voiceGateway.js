@@ -71,7 +71,7 @@ export function initVoiceGateway(httpServer) {
 
         switch (type) {
           case 'start_turn': {
-            const { turnId, text, inputType = 'text', seq = 0 } = data;
+            const { turnId, text, inputType = 'text', language, seq = 0 } = data;
             if (!turnId || !text) {
               sendEvent({
                 type: 'error',
@@ -87,6 +87,7 @@ export function initVoiceGateway(httpServer) {
               seq,
               text,
               inputType,
+              language,
               sendEvent,
             });
             break;
