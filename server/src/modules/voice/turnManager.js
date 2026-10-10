@@ -79,14 +79,7 @@ export class TurnManager {
       isFinal: true,
     });
 
-    // 4. Check for standalone voice command
-    const command = parseVoiceCommand(cleanText);
-    if (command) {
-      await this.handleCommand({ command, sessionId, turnId, sendEvent });
-      return;
-    }
-
-    // 5. Send server status: THINKING
+    // 4. Send server status: THINKING
     await SessionController.updateStatus(sessionId, 'THINKING');
     sendEvent({ type: 'status', state: 'THINKING' });
 
@@ -221,11 +214,12 @@ export class TurnManager {
    * @param {string} params.turnId
    * @param {function(Object): void} params.sendEvent
    */
-  async handleInterrupt({ sessionId, turnId, sendEvent }) {
+  async handleInterrupt({ sessionId, turnId, lastSpokenSegmentIndex = -1, sendEvent }) {
     const activeTurn = this.activeTurns.get(sessionId);
 
     let interruptedText = '';
     let segments = [];
+    let generationComplete = false;
     const sourceId = turnId || activeTurn?.turnId || null;
 
     if (activeTurn && (!turnId || activeTurn.turnId === turnId)) {
@@ -236,6 +230,19 @@ export class TurnManager {
       interruptedText = activeTurn.generatedText;
       segments = activeTurn.segments;
       this.activeTurns.delete(sessionId);
+    } else {
+      const sessionData = await SessionController.getSessionData(sessionId);
+      if (sessionData?.pausedResponse && sessionData.pausedResponse.sourceTurnId === sourceId) {
+        interruptedText = sessionData.pausedResponse.generatedText;
+        segments = sessionData.pausedResponse.segments;
+        generationComplete = sessionData.pausedResponse.generationComplete;
+      } else {
+        const msg = sessionData?.messages?.find(m => m.turnId === sourceId && m.sender === 'assistant');
+        if (msg) {
+          interruptedText = msg.text;
+          generationComplete = true;
+        }
+      }
     }
 
     logger.info(`Turn ${sourceId} interrupted by user barge-in`);
@@ -244,8 +251,8 @@ export class TurnManager {
     const pausedState = {
       sourceTurnId: sourceId,
       generatedText: interruptedText,
-      lastSpokenSegmentIndex: -1,
-      generationComplete: false,
+      lastSpokenSegmentIndex,
+      generationComplete,
       segments,
       timestamp: Date.now(),
     };
@@ -326,6 +333,12 @@ export class TurnManager {
     // If generation was interrupted mid-stream, request continuation from LLM
     const continuationTurnId = turnId || ('turn_' + Math.random().toString(36).substring(2, 10));
     const abortController = new AbortController();
+    let maxSegmentIndex = -1;
+    if (paused.segments && paused.segments.length > 0) {
+      maxSegmentIndex = Math.max(...paused.segments.map(s => s.index));
+    }
+    const nextSegIdx = Math.max(maxSegmentIndex + 1, lastSpokenSegmentIndex + 1);
+
     const turnState = {
       turnId: continuationTurnId,
       sessionId,
@@ -333,7 +346,7 @@ export class TurnManager {
       text: 'continue',
       abortController,
       seq: 0,
-      nextSegmentIndex: Math.max(0, lastSpokenSegmentIndex + 1),
+      nextSegmentIndex: nextSegIdx,
       generatedText: '',
       segments: [],
       isAborted: false,

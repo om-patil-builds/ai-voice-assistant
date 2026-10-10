@@ -13,12 +13,10 @@ test('TurnManager - turn creation, cancellation, and barge-in interruption', asy
     emittedEvents.push(event);
   };
 
-  // 1. User says "stop" command
-  await turnManager.startTurn({
+  // 1. User says "stop" command (client sends stop event)
+  await turnManager.handleStop({
     sessionId,
     turnId: 'turn_cmd_1',
-    text: 'stop',
-    inputType: 'text',
     sendEvent,
   });
 
