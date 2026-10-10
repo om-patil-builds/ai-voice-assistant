@@ -18,14 +18,14 @@ export const SESSION_STATES = {
   ERROR: 'ERROR',
 };
 
-// Recognized standalone voice commands
+// Recognized standalone voice commands (English, Hindi, Marathi)
 const COMMAND_REGEXES = {
-  STOP: /^(?:please\s+)?(?:stop|stop\s+talking|shut\s+up|cancel|halt)$/i,
-  CONTINUE: /^(?:please\s+)?(?:continue|continue\s+last\s+response|keep\s+going|go\s+on|resume)(?:\s+please)?$/i,
-  REPEAT: /^(?:please\s+)?(?:repeat\s+that|repeat\s+last\s+(?:response|answer)|say\s+that\s+again|repeat)(?:\s+please)?$/i,
-  MUTE: /^(?:please\s+)?(?:mute|mute\s+audio|mute\s+voice)(?:\s+please)?$/i,
-  UNMUTE: /^(?:please\s+)?(?:unmute|unmute\s+audio|unmute\s+voice)(?:\s+please)?$/i,
-  CLEAR_CHAT: /^(?:please\s+)?(?:clear\s+chat|clear\s+history|delete\s+chat|clear\s+conversation)(?:\s+please)?$/i,
+  STOP: /^(?:(?:please|कृपया)\s+)?(?:stop|stop\s+talking|shut\s+up|cancel|halt|रुको|रुकिए|रुक\s+जाओ|बंद\s+करो|चुप\s+रहो|थांबा|थांब|बोलणे\s+थांबवा|बंद\s+करा|स्टॉप|ruko|ruk\s+jao|band\s+karo|thamba|thamb|band\s+kara)$/i,
+  CONTINUE: /^(?:(?:please|कृपया)\s+)?(?:continue|continue\s+last\s+response|keep\s+going|go\s+on|resume|जारी\s+रखो|आगे\s+बोलो|आगे\s+बताओ|चालू\s+रखो|पुढे\s+बोला|पुढे\s+सांगा|सुरू\s+ठेवा|चालू\s+ठेवा|कंटिन्यू|aage\s+bolo|aage\s+batao|jaari\s+rakho|pudhe\s+bola|pudhe\s+sanga|suru\s+theva)(?:\s+(?:please|कृपया))?$/i,
+  REPEAT: /^(?:(?:please|कृपया)\s+)?(?:repeat\s+that|repeat\s+last\s+(?:response|answer)|say\s+that\s+again|repeat|फिर\s+से\s+बोलो|दोहराओ|दोबारा\s+बोलो|फिर\s+से\s+बताओ|पुन्हा\s+सांगा|पुन्हा\s+बोला|परत\s+सांगा|परत\s+बोला|phir\s+se\s+bolo|dohrao|dobara\s+bolo|punha\s+sanga|punha\s+bola|parat\s+sanga)(?:\s+(?:please|कृपया))?$/i,
+  MUTE: /^(?:(?:please|कृपया)\s+)?(?:mute|mute\s+audio|mute\s+voice|म्यूट|म्यूट\s+करो|म्यूट\s+करा|आवाज\s+बंद\s+करो|आवाज\s+बंद\s+करा)(?:\s+(?:please|कृपया))?$/i,
+  UNMUTE: /^(?:(?:please|कृपया)\s+)?(?:unmute|unmute\s+audio|unmute\s+voice|अनम्यूट|अनम्यूट\s+करो|अनम्यूट\s+करा|आवाज\s+चालू\s+करो|आवाज\s+चालू\s+करा|आवाज\s+शुरू\s+करो|आवाज\s+सुरू\s+करा)(?:\s+(?:please|कृपया))?$/i,
+  CLEAR_CHAT: /^(?:(?:please|कृपया)\s+)?(?:clear\s+chat|clear\s+history|delete\s+chat|clear\s+conversation|चैट\s+साफ\s+करो|चैट\s+हटाओ|चॅट\s+साफ\s+करा|चॅट\s+हटवा|संभाषण\s+साफ\s+करा)(?:\s+(?:please|कृपया))?$/i,
 };
 
 export function parseVoiceCommand(rawText) {
@@ -166,7 +166,7 @@ export function useVoiceSession() {
 
       // 4. Notify backend WebSocket to abort LLM generation
       if (turnId) {
-        socketClient.interrupt(turnId);
+        socketClient.interrupt(turnId, cancelResult.lastSpokenSegmentIndex);
       }
 
       // 5. Invalidate active turn so any late server tokens are rejected
@@ -197,7 +197,9 @@ export function useVoiceSession() {
 
     player.onQueueEmpty = ({ turnId }) => {
       if (turnId === activeTurnIdRef.current || turnId === 'repeat') {
-        setStatus((prev) => (prev === SESSION_STATES.SPEAKING ? SESSION_STATES.LISTENING : prev));
+        if (playbackCursorRef.current.generationComplete || turnId === 'repeat') {
+          setStatus((prev) => (prev === SESSION_STATES.SPEAKING ? SESSION_STATES.LISTENING : prev));
+        }
       }
     };
 
@@ -215,10 +217,8 @@ export function useVoiceSession() {
       abortControllerRef.current = null;
     }
     ttsPlayerRef.current.cancel();
-    if (activeTurnIdRef.current) {
-      socketClient.stop(activeTurnIdRef.current);
-      activeTurnIdRef.current = null;
-    }
+    socketClient.stop(activeTurnIdRef.current || 'generic_stop');
+    activeTurnIdRef.current = null;
     setStatus(SESSION_STATES.IDLE);
   };
 
@@ -288,6 +288,8 @@ export function useVoiceSession() {
     if (generationComplete && remainingSegments.length > 0) {
       // Full LLM response was already received! Play unspoken segments immediately.
       setStatus(SESSION_STATES.SPEAKING);
+      
+      activeTurnIdRef.current = sourceTurnId;
       ttsPlayerRef.current.resetForTurn(sourceTurnId);
 
       remainingSegments.forEach((seg) => {
@@ -313,8 +315,13 @@ export function useVoiceSession() {
       const newTurnId = 'turn_' + Math.random().toString(36).substring(2, 10);
       activeTurnIdRef.current = newTurnId;
       lastReceivedSeqRef.current = -1;
-      currentStreamingTextRef.current = paused.generatedText ? paused.generatedText + ' ' : '';
+      currentStreamingTextRef.current = paused.generatedText ? paused.generatedText + (paused.generatedText.endsWith(' ') ? '' : ' ') : '';
       setStatus(SESSION_STATES.THINKING);
+
+      playbackCursorRef.current.initTurn(newTurnId);
+      paused.segments.forEach(s => playbackCursorRef.current.addSegment(s.index, s.text));
+      playbackCursorRef.current.setGeneratedText(currentStreamingTextRef.current);
+      playbackCursorRef.current.lastSpokenSegmentIndex = lastSpokenSegmentIndex;
 
       // Update the interrupted assistant message to resumed/streaming with the new turnId
       setMessages((prev) =>
@@ -331,11 +338,15 @@ export function useVoiceSession() {
         lastSpokenSegmentIndex,
       });
 
-      // If backend is offline or fallback, speak whatever unplayed segments exist
+      const nextIndex = Math.max(0, lastSpokenSegmentIndex + 1);
+      ttsPlayerRef.current.resetForTurn(newTurnId, nextIndex);
+      setStatus(SESSION_STATES.SPEAKING);
+
       if (remainingSegments.length > 0) {
         remainingSegments.forEach((seg) => {
           ttsPlayerRef.current.enqueueSegment(seg.text, seg.index, newTurnId);
         });
+        ttsPlayerRef.current.nextSegmentIndex = Math.max(...remainingSegments.map(s => s.index)) + 1;
       }
     }
   };
@@ -343,7 +354,7 @@ export function useVoiceSession() {
   /**
    * Start a new turn (from transcribed voice or typed text fallback)
    */
-  const startTurnWithText = (text, inputType = 'text') => {
+  const startTurnWithText = (text, inputType = 'text', language = null) => {
     if (!text || !text.trim()) return;
 
     if (abortControllerRef.current) {
@@ -352,6 +363,14 @@ export function useVoiceSession() {
     }
 
     const trimmedText = normalizeTechTerms(text.trim());
+
+    // Check for standalone voice command FIRST
+    const command = parseVoiceCommand(trimmedText);
+    if (command) {
+      handleVoiceCommand(command);
+      return;
+    }
+
     const newTurnId = 'turn_' + Math.random().toString(36).substring(2, 10);
     activeTurnIdRef.current = newTurnId;
     activeTurnSeqRef.current = 0;
@@ -401,6 +420,7 @@ export function useVoiceSession() {
       seq: 0,
       inputType,
       text: trimmedText,
+      language,
     });
   };
 
@@ -495,15 +515,8 @@ export function useVoiceSession() {
         // Normalize developer terms, frameworks, and accent misrecognitions
         normalizedTranscript = normalizeTechTerms(normalizedTranscript);
 
-        // Voice Command Parsing
-        const command = parseVoiceCommand(normalizedTranscript);
-        if (command) {
-          handleVoiceCommand(command);
-          return;
-        }
-
-        // Ordinary speech utterance -> Start new turn
-        startTurnWithText(normalizedTranscript, 'audio');
+        // Ordinary speech utterance -> Start new turn with detected language
+        startTurnWithText(normalizedTranscript, 'audio', result?.language);
       } catch (err) {
         if (err.name === 'AbortError') {
           // Interrupted by barge-in or user stop; do not transition to ERROR
@@ -650,7 +663,7 @@ export function useVoiceSession() {
       playbackCursorRef.current.setGeneratedText(currentStreamingTextRef.current);
 
       // Feed delta to TTS player for sentence chunking
-      ttsPlayerRef.current.feedDelta(delta, turnId, false);
+      ttsPlayerRef.current.feedDelta(delta, turnId, false, data.language);
 
       // Update message bubble in UI (ONLY assistant message!)
       setMessages((prev) =>
@@ -702,7 +715,7 @@ export function useVoiceSession() {
       const { turnId } = data;
       if (turnId !== activeTurnIdRef.current) return;
 
-      ttsPlayerRef.current.feedDelta('', turnId, true);
+      ttsPlayerRef.current.feedDelta('', turnId, true, data.language);
       playbackCursorRef.current.markGenerationComplete();
 
       // Only mark assistant message as completed

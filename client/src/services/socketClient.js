@@ -226,25 +226,34 @@ export class SocketClient {
    * @param {'text'|'audio'} params.inputType
    * @param {string} [params.text]
    */
-  startTurn({ turnId, seq = 0, inputType = 'text', text = '' }) {
-    return this.send({
+  startTurn({ turnId, seq = 0, inputType = 'text', text = '', language }) {
+    const payload = {
       type: 'start_turn',
       turnId,
       seq,
       inputType,
       text,
-    });
+    };
+    if (language) {
+      payload.language = language;
+    }
+    return this.send(payload);
   }
 
   /**
    * Convenience sender for interrupt
    * @param {string} turnId
+   * @param {number} lastSpokenSegmentIndex
    */
-  interrupt(turnId) {
-    return this.send({
+  interrupt(turnId, lastSpokenSegmentIndex) {
+    const payload = {
       type: 'interrupt',
       turnId,
-    });
+    };
+    if (typeof lastSpokenSegmentIndex === 'number' && lastSpokenSegmentIndex >= 0) {
+      payload.lastSpokenSegmentIndex = lastSpokenSegmentIndex;
+    }
+    return this.send(payload);
   }
 
   /**

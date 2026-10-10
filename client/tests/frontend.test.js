@@ -6,6 +6,8 @@ import { SocketClient } from '../src/services/socketClient.js';
 import { ApiClient } from '../src/services/apiClient.js';
 import { TTSPlayer } from '../src/audio/ttsPlayer.js';
 import { encodeWav, downsampleBuffer, mergeBuffers, calculateRmsAndPeak } from '../src/audio/wavEncoder.js';
+import { detectLanguage, normalizeLanguageCode } from '../src/services/languageDetector.js';
+import { normalizeTechTerms, isTechnicalTermQuery } from '../src/services/techTermNormalizer.js';
 
 test('PlaybackCursor - segment tracking and interruption checkpoints', () => {
   const cursor = new PlaybackCursor();
@@ -61,38 +63,54 @@ test('PlaybackCursor - state restoration from session API', () => {
   assert.equal(cursor.getRemainingSegments()[0].text, 'Sentence two.');
 });
 
-test('CommandParser - standalone voice commands recognition', () => {
-  // Positive matches for STOP
+test('CommandParser - standalone voice commands recognition (English, Marathi, Hindi)', () => {
+  // Positive matches for STOP (English, Marathi, Hindi)
   assert.equal(parseVoiceCommand('stop'), 'STOP');
   assert.equal(parseVoiceCommand('Stop!'), 'STOP');
   assert.equal(parseVoiceCommand('stop talking'), 'STOP');
   assert.equal(parseVoiceCommand('please stop'), 'STOP');
   assert.equal(parseVoiceCommand('cancel'), 'STOP');
+  assert.equal(parseVoiceCommand('थांबा'), 'STOP');
+  assert.equal(parseVoiceCommand('बंद करा'), 'STOP');
+  assert.equal(parseVoiceCommand('रुको'), 'STOP');
+  assert.equal(parseVoiceCommand('रुक जाओ'), 'STOP');
 
-  // Positive matches for CONTINUE
+  // Positive matches for CONTINUE (English, Marathi, Hindi)
   assert.equal(parseVoiceCommand('continue'), 'CONTINUE');
   assert.equal(parseVoiceCommand('continue last response'), 'CONTINUE');
   assert.equal(parseVoiceCommand('keep going'), 'CONTINUE');
   assert.equal(parseVoiceCommand('go on'), 'CONTINUE');
   assert.equal(parseVoiceCommand('resume please'), 'CONTINUE');
+  assert.equal(parseVoiceCommand('पुढे बोला'), 'CONTINUE');
+  assert.equal(parseVoiceCommand('सुरू ठेवा'), 'CONTINUE');
+  assert.equal(parseVoiceCommand('आगे बोलो'), 'CONTINUE');
+  assert.equal(parseVoiceCommand('जारी रखो'), 'CONTINUE');
 
-  // Positive matches for REPEAT
+  // Positive matches for REPEAT (English, Marathi, Hindi)
   assert.equal(parseVoiceCommand('repeat that'), 'REPEAT');
   assert.equal(parseVoiceCommand('say that again'), 'REPEAT');
   assert.equal(parseVoiceCommand('repeat last response'), 'REPEAT');
   assert.equal(parseVoiceCommand('repeat'), 'REPEAT');
+  assert.equal(parseVoiceCommand('पुन्हा सांगा'), 'REPEAT');
+  assert.equal(parseVoiceCommand('परत सांगा'), 'REPEAT');
+  assert.equal(parseVoiceCommand('फिर से बोलो'), 'REPEAT');
+  assert.equal(parseVoiceCommand('दोबारा बोलो'), 'REPEAT');
 
-  // Positive matches for MUTE / UNMUTE
+  // Positive matches for MUTE / UNMUTE (English, Marathi, Hindi)
   assert.equal(parseVoiceCommand('mute'), 'MUTE');
   assert.equal(parseVoiceCommand('mute audio'), 'MUTE');
+  assert.equal(parseVoiceCommand('आवाज बंद करा'), 'MUTE');
+  assert.equal(parseVoiceCommand('आवाज बंद करो'), 'MUTE');
   assert.equal(parseVoiceCommand('unmute'), 'UNMUTE');
+  assert.equal(parseVoiceCommand('आवाज सुरू करा'), 'UNMUTE');
+  assert.equal(parseVoiceCommand('आवाज चालू करो'), 'UNMUTE');
 
   // Positive matches for CLEAR_CHAT
   assert.equal(parseVoiceCommand('clear chat'), 'CLEAR_CHAT');
   assert.equal(parseVoiceCommand('clear history'), 'CLEAR_CHAT');
 });
 
-test('CommandParser - avoids misclassifying commands inside ordinary questions', () => {
+test('CommandParser - avoids misclassifying commands inside ordinary questions (multilingual)', () => {
   // Should NOT trigger commands when embedded in ordinary sentences
   assert.equal(parseVoiceCommand('Can you continue explaining quantum physics?'), null);
   assert.equal(parseVoiceCommand('What should I stop doing in life?'), null);
@@ -102,6 +120,10 @@ test('CommandParser - avoids misclassifying commands inside ordinary questions',
   assert.equal(parseVoiceCommand('How do I mute my microphone?'), null);
   assert.equal(parseVoiceCommand('Is it possible to clear my cache?'), null);
   assert.equal(parseVoiceCommand('Tell me a story about a nonstop train'), null);
+  assert.equal(parseVoiceCommand('मला मर्न स्टॅक बद्दल पुढे सांगा?'), null);
+  assert.equal(parseVoiceCommand('क्या आप आगे बता सकते हैं?'), null);
+  assert.equal(parseVoiceCommand('आयुष्यात काय थांबवले पाहिजे?'), null);
+  assert.equal(parseVoiceCommand('जिंदगी में क्या रोकना चाहिए?'), null);
 });
 
 test('SocketClient - message schema validation', () => {
@@ -294,16 +316,22 @@ test('TTSPlayer - sentence chunking, queue management, and volume/rate controls'
 
   // Test sentence chunking via feedDelta
   player.resetForTurn('turn_delta_test');
-  player.feedDelta('Hello there! ', 'turn_delta_test', false);
-  player.feedDelta('How can I help you today? ', 'turn_delta_test', false);
+  player.feedDelta('Hello there! ', 'turn_delta_test', false, 'en');
+  player.feedDelta('How can I help you today? ', 'turn_delta_test', false, 'en');
 
   // In Node environment without window.speechSynthesis, queue items are pushed
   // (or shifted if non-browser fallback plays immediately)
   assert.ok(player.nextSegmentIndex >= 2, 'Should extract at least 2 completed sentence segments');
 
+  // Test sentence chunking for Devanagari with Purna Viram (।)
+  player.resetForTurn('turn_marathi_purna_viram');
+  player.feedDelta('हे पहिले वाक्य आहे। ', 'turn_marathi_purna_viram', false, 'mr');
+  player.feedDelta('हे दुसरे वाक्य आहे। ', 'turn_marathi_purna_viram', false, 'mr');
+  assert.ok(player.nextSegmentIndex >= 2, 'Should extract Devanagari sentences split by Purna Viram');
+
   // Test cancel
   const cancelResult = player.cancel();
-  assert.equal(cancelResult.sourceTurnId, 'turn_delta_test');
+  assert.equal(cancelResult.sourceTurnId, 'turn_marathi_purna_viram');
   assert.equal(player.isSpeaking, false);
   assert.equal(player.queue.length, 0);
 });
@@ -354,3 +382,52 @@ test('WAV Encoder - lossless PCM generation, downsampling, and energy detection'
   assert.equal(view.getUint32(24, true), 16000, 'SampleRate must be 16000');
   assert.equal(view.getUint16(34, true), 16, 'BitsPerSample must be 16');
 });
+
+test('LanguageDetector (client) - multi-language detection and code-mixing', () => {
+  // English
+  assert.equal(detectLanguage('What is the MERN stack?'), 'en');
+  assert.equal(detectLanguage('Can you help me build a website?'), 'en');
+
+  // Marathi in Devanagari
+  assert.equal(detectLanguage('मर्न स्टॅक म्हणजे काय?'), 'mr');
+  assert.equal(detectLanguage('मला सांगा तुम्ही काय करू शकता?'), 'mr');
+  assert.equal(detectLanguage('सकाळच्या नाश्त्यात काय खावे?'), 'mr');
+
+  // Hindi in Devanagari
+  assert.equal(detectLanguage('मर्न स्टैक क्या है?'), 'hi');
+  assert.equal(detectLanguage('मुझे बताओ तुम क्या कर सकते हो?'), 'hi');
+  assert.equal(detectLanguage('आप कैसे हैं?'), 'hi');
+
+  // Code-mixed (Maranglish / Hinglish)
+  assert.equal(detectLanguage('MERN stack mhanje kay?'), 'mr');
+  assert.equal(detectLanguage('mala sanga na'), 'mr');
+  assert.equal(detectLanguage('MERN stack kya hota hai?'), 'hi');
+  assert.equal(detectLanguage('mujhe batao please'), 'hi');
+
+  // Normalization
+  assert.equal(normalizeLanguageCode('mr-IN'), 'mr');
+  assert.equal(normalizeLanguageCode('hi-IN'), 'hi');
+  assert.equal(normalizeLanguageCode('en-US'), 'en');
+  assert.equal(normalizeLanguageCode(null), 'en');
+});
+
+test('TechTermNormalizer (client) - normalizes English and Devanagari developer terms', () => {
+  // English variations
+  assert.equal(normalizeTechTerms('mern stack'), 'MERN Stack');
+  assert.equal(normalizeTechTerms('mango db'), 'MongoDB');
+  assert.equal(normalizeTechTerms('express js'), 'Express.js');
+  assert.equal(normalizeTechTerms('react js'), 'React.js');
+  assert.equal(normalizeTechTerms('note js'), 'Node.js');
+
+  // Devanagari terms
+  assert.equal(normalizeTechTerms('मर्न स्टॅक म्हणजे काय?'), 'MERN Stack म्हणजे काय?');
+  assert.equal(normalizeTechTerms('मर्न स्टैक क्या है?'), 'MERN Stack क्या है?');
+  assert.equal(normalizeTechTerms('मोंगो डीबी बद्दल सांगा'), 'MongoDB बद्दल सांगा');
+  assert.equal(normalizeTechTerms('रिएक्ट जेएस शिका'), 'React.js शिका');
+
+  // Query check
+  assert.equal(isTechnicalTermQuery('MERN Stack'), true);
+  assert.equal(isTechnicalTermQuery('मर्न स्टॅक'), true);
+  assert.equal(isTechnicalTermQuery('hello there'), false);
+});
+

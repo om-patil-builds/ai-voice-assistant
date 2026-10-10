@@ -157,6 +157,48 @@ export const TECH_TERM_PATTERNS = [
     pattern: /(?<!\w)back\s+end(?!\w)/gi,
     replacement: 'backend',
   },
+
+  // 15. Devanagari phonetic variations for Hindi and Marathi
+  {
+    pattern: /(?:मर्न|मैन|मन)\s*स्ट[ॅै]क/gi,
+    replacement: 'MERN Stack',
+  },
+  {
+    pattern: /(?:म[ोॉौ]?[ंँ]?(?:न्)?गो\s*(?:डी[\s.]*बी|डेटाबेस|डाटाबेस)|म[ोॉौ]?[ंँ]?(?:न्)?गो\s*डीबी)/gi,
+    replacement: 'MongoDB',
+  },
+  {
+    pattern: /(?:एक्सप्रेस\s*(?:डॉट\s*)?जे[\s.]*एस)/gi,
+    replacement: 'Express.js',
+  },
+  {
+    pattern: /(?:रि[एअॅ]क्ट\s+नेटिव)/gi,
+    replacement: 'React Native',
+  },
+  {
+    pattern: /(?:रि[एअॅ]क्ट\s*(?:डॉट\s*)?जे[\s.]*एस)/gi,
+    replacement: 'React.js',
+  },
+  {
+    pattern: /(?:नोड\s*(?:डॉट\s*)?जे[\s.]*एस)/gi,
+    replacement: 'Node.js',
+  },
+  {
+    pattern: /(?:जावा\s*स्क्रिप्ट)/gi,
+    replacement: 'JavaScript',
+  },
+  {
+    pattern: /(?:टाइप\s*स्क्रिप्ट)/gi,
+    replacement: 'TypeScript',
+  },
+  {
+    pattern: /(?:रेस्ट\s+एपीआई)/gi,
+    replacement: 'REST API',
+  },
+  {
+    pattern: /(?:एपीआई)/gi,
+    replacement: 'API',
+  },
 ];
 
 /**
@@ -179,3 +221,24 @@ export function normalizeTechTerms(text) {
 
   return normalized;
 }
+
+/**
+ * Checks if an input is primarily a technical term query
+ * @param {string} text
+ * @returns {boolean}
+ */
+export function isTechnicalTermQuery(text) {
+  if (!text || typeof text !== 'string') return false;
+  const clean = text.trim().toLowerCase();
+
+  const techTerms = [
+    'mern', 'mern stack', 'mean', 'mean stack', 'lamp stack',
+    'mongodb', 'express', 'express.js', 'react', 'react.js',
+    'node', 'node.js', 'javascript', 'typescript', 'api', 'rest api',
+    'graphql', 'postgresql', 'nosql', 'frontend', 'backend', 'full-stack',
+    'मर्न', 'मर्न स्टॅक', 'मर्न स्टैक', 'मोंगो', 'एक्सप्रेस', 'रिएक्ट', 'नोड', 'एपीआई'
+  ];
+
+  return techTerms.some((term) => clean === term || clean.includes(term));
+}
+

@@ -121,18 +121,35 @@ export class VoiceActivityDetector {
       this.analyser.smoothingTimeConstant = 0.2;
       this.mediaStreamSource.connect(this.analyser);
 
-      // Create ScriptProcessorNode for lossless continuous audio processing
-      // Buffer size 4096 at 48kHz = 85.3ms chunks
-      const bufferSize = 4096;
-      this.scriptProcessor = this.audioContext.createScriptProcessor(bufferSize, 1, 1);
+      const workletCode = `
+class VadProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.bufferSize = 4096;
+    this.buffer = new Float32Array(this.bufferSize);
+    this.pointer = 0;
+  }
 
-      // Zero-gain node keeps the audio graph alive without playing mic into speakers
-      this.zeroGain = this.audioContext.createGain();
-      this.zeroGain.gain.value = 0;
+  process(inputs, outputs, parameters) {
+    const input = inputs[0];
+    if (!input || !input.length) return true;
+    
+    const channelData = input[0];
+    for (let i = 0; i < channelData.length; i++) {
+      this.buffer[this.pointer++] = channelData[i];
+      if (this.pointer >= this.bufferSize) {
+        this.port.postMessage(this.buffer.slice());
+        this.pointer = 0;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('vad-processor', VadProcessor);
+      `;
 
-      this.mediaStreamSource.connect(this.scriptProcessor);
-      this.scriptProcessor.connect(this.zeroGain);
-      this.zeroGain.connect(this.audioContext.destination);
+      const blob = new Blob([workletCode], { type: 'application/javascript' });
+      const workletUrl = URL.createObjectURL(blob);
 
       this.preRollChunks = [];
       this.recordedSpeechChunks = [];
@@ -141,9 +158,25 @@ export class VoiceActivityDetector {
       this.candidateSpeechStart = 0;
       this.silenceStartTime = 0;
 
-      this.scriptProcessor.onaudioprocess = (event) => {
-        this._processAudioFrame(event);
-      };
+      this.audioContext.audioWorklet.addModule(workletUrl).then(() => {
+        this.audioWorkletNode = new AudioWorkletNode(this.audioContext, 'vad-processor');
+        
+        this.audioWorkletNode.port.onmessage = (event) => {
+          this._processAudioFrame(event.data);
+        };
+
+        this.mediaStreamSource.connect(this.audioWorkletNode);
+
+        // Zero-gain node keeps the audio graph alive without playing mic into speakers
+        this.zeroGain = this.audioContext.createGain();
+        this.zeroGain.gain.value = 0;
+        
+        this.audioWorkletNode.connect(this.zeroGain);
+        this.zeroGain.connect(this.audioContext.destination);
+      }).catch(err => {
+        console.error('Failed to load AudioWorklet:', err);
+        this.onError(err);
+      });
     } catch (err) {
       console.error('Failed to start VoiceActivityDetector:', err);
       this.onError(err);
@@ -152,19 +185,18 @@ export class VoiceActivityDetector {
 
   /**
    * Process incoming PCM audio frame
-   * @param {AudioProcessingEvent} event
+   * @param {Float32Array} inputData
    */
-  _processAudioFrame(event) {
+  _processAudioFrame(inputData) {
     if (!this.isListening) return;
 
-    const inputData = event.inputBuffer.getChannelData(0);
     if (!inputData || inputData.length === 0) return;
 
     // Fast copy of current frame for recording buffer
     const frameCopy = new Float32Array(inputData);
 
     // Compute RMS and peak energy
-    const { rms, peak } = calculateRmsAndPeak(frameCopy);
+    const { rms } = calculateRmsAndPeak(frameCopy);
 
     // Report normalized level to UI visualizer (scale ~0.0 to 1.0)
     const normalizedLevel = Math.min(1.0, rms * 14);
@@ -290,14 +322,14 @@ export class VoiceActivityDetector {
     this.preRollChunks = [];
     this.recordedSpeechChunks = [];
 
-    if (this.scriptProcessor) {
-      this.scriptProcessor.onaudioprocess = null;
+    if (this.audioWorkletNode) {
+      this.audioWorkletNode.port.onmessage = null;
       try {
-        this.scriptProcessor.disconnect();
+        this.audioWorkletNode.disconnect();
       } catch {
         // ignore
       }
-      this.scriptProcessor = null;
+      this.audioWorkletNode = null;
     }
 
     if (this.zeroGain) {
