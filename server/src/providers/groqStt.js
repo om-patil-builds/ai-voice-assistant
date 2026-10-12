@@ -17,7 +17,7 @@ function getGroqClient() {
     );
   }
   if (!groqClient) {
-    groqClient = new Groq({ apiKey: config.groqApiKey });
+    groqClient = new Groq({ apiKey: config.groqApiKey, maxRetries: 0 });
   }
   return groqClient;
 }
@@ -43,13 +43,13 @@ export function sanitizeSttPrompt(prompt, maxBytes = 800) {
 }
 
 /**
- * Contextual prompt for Whisper STT multilingual biasing.
- * Priming Whisper with English, Hindi, and Marathi vocabulary ensures high accuracy
- * across all three languages and mixed speech (Hinglish/Maranglish), and voice commands.
- * Kept well under Groq's 896 UTF-8 byte limit (~480 bytes).
+ * Contextual prompt for Whisper STT technical vocabulary biasing.
+ * Providing clean, domain-appropriate vocabulary guides Whisper's decoder
+ * without confusing multi-script labels or prompting hallucinations.
+ * Kept strictly under Groq's 896 UTF-8 byte limit.
  */
 export const STT_VOCABULARY_PROMPT = sanitizeSttPrompt(
-  'MERN stack, MongoDB, Express.js, React.js, Node.js, JavaScript, TypeScript, REST API, GraphQL, full-stack. हिंदी/मराठी: नमस्ते, नमस्कार, मर्न स्टॅक, मर्न स्टैक, क्या है, म्हणजे काय, रुको, थांबा, आगे बोलो, पुढे बोला, फिर से बोलो, पुन्हा सांगा. Commands: Stop, Continue, Repeat, Mute.'
+  'MERN stack, MongoDB, Express.js, React.js, Node.js, JavaScript, TypeScript, REST API, GraphQL, full-stack web development.'
 );
 
 
@@ -173,11 +173,9 @@ export async function transcribeAudio(audioBuffer, options = {}) {
 
     const detectedLang = normalizeLanguageCode(response.language || config.groqSttLanguage || 'en');
 
-    logger.info(`STT transcription succeeded in ${elapsedMs}ms`, {
-      duration: response.duration,
-      transcript: rawText,
-      language: detectedLang,
-    });
+    logger.info(
+      `[STT Groq Whisper] Completed in ${elapsedMs}ms | Audio Size: ${audioBuffer.length} bytes | Recording Duration: ${response.duration || 0}s | Transcript: "${rawText}" | Language: ${detectedLang}`
+    );
 
     return {
       transcript: rawText,

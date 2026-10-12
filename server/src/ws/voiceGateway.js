@@ -94,10 +94,11 @@ export function initVoiceGateway(httpServer) {
           }
 
           case 'interrupt': {
-            const { turnId } = data;
+            const { turnId, lastSpokenSegmentIndex } = data;
             await turnManager.handleInterrupt({
               sessionId,
               turnId,
+              lastSpokenSegmentIndex,
               sendEvent,
             });
             break;

@@ -26,8 +26,9 @@ export function mergeBuffers(chunks) {
 }
 
 /**
- * Downsample Float32Array from sourceSampleRate to targetSampleRate (e.g., 48000 -> 16000)
- * Uses linear interpolation for clean acoustic frequency preservation.
+ * Downsample Float32Array from sourceSampleRate to targetSampleRate (e.g., 48000 -> 16000).
+ * Implements an anti-aliased area-averaging filter to eliminate high-frequency aliasing
+ * that occurs when decimating from 48kHz or 44.1kHz down to 16kHz.
  *
  * @param {Float32Array} buffer
  * @param {number} sourceSampleRate
@@ -39,19 +40,86 @@ export function downsampleBuffer(buffer, sourceSampleRate, targetSampleRate = 16
   if (sourceSampleRate === targetSampleRate) return buffer;
 
   const ratio = sourceSampleRate / targetSampleRate;
-  const newLength = Math.round(buffer.length / ratio);
+  const newLength = Math.floor(buffer.length / ratio);
   const result = new Float32Array(newLength);
 
   for (let i = 0; i < newLength; i++) {
-    const originalPos = i * ratio;
-    const leftIndex = Math.floor(originalPos);
-    const rightIndex = Math.min(leftIndex + 1, buffer.length - 1);
-    const fraction = originalPos - leftIndex;
+    const startPos = i * ratio;
+    const endPos = (i + 1) * ratio;
 
-    result[i] = buffer[leftIndex] * (1 - fraction) + buffer[rightIndex] * fraction;
+    let sum = 0;
+    let weightSum = 0;
+
+    const startIdx = Math.floor(startPos);
+    const endIdx = Math.min(buffer.length - 1, Math.ceil(endPos));
+
+    for (let j = startIdx; j <= endIdx; j++) {
+      const sampleStart = j;
+      const sampleEnd = j + 1;
+      const overlapStart = Math.max(startPos, sampleStart);
+      const overlapEnd = Math.min(endPos, sampleEnd);
+
+      if (overlapEnd > overlapStart) {
+        const weight = overlapEnd - overlapStart;
+        sum += buffer[j] * weight;
+        weightSum += weight;
+      }
+    }
+
+    result[i] = weightSum > 0 ? sum / weightSum : buffer[startIdx];
   }
 
   return result;
+}
+
+/**
+ * Trims excess silence from the start and end of a Float32Array speech buffer
+ * while preserving natural pre-roll and post-roll acoustic padding.
+ *
+ * @param {Float32Array} buffer - Audio samples
+ * @param {number} [sampleRate=16000] - Sample rate in Hz
+ * @param {number} [threshold=0.009] - RMS silence threshold
+ * @param {number} [leadingPadMs=180] - Leading silence padding (ms) to protect consonants
+ * @param {number} [trailingPadMs=200] - Trailing silence padding (ms) to protect vowels
+ * @returns {Float32Array} Trimmed audio buffer
+ */
+export function trimSilence(buffer, sampleRate = 16000, threshold = 0.009, leadingPadMs = 180, trailingPadMs = 200) {
+  if (!buffer || buffer.length === 0) return new Float32Array(0);
+
+  const windowSize = Math.max(128, Math.round(sampleRate * 0.015)); // ~15ms window
+  const totalSamples = buffer.length;
+
+  let firstVoicedIdx = -1;
+  let lastVoicedIdx = -1;
+
+  for (let i = 0; i <= totalSamples - windowSize; i += windowSize) {
+    let sumSq = 0;
+    for (let j = 0; j < windowSize; j++) {
+      const s = buffer[i + j];
+      sumSq += s * s;
+    }
+    const rms = Math.sqrt(sumSq / windowSize);
+
+    if (rms >= threshold) {
+      if (firstVoicedIdx === -1) {
+        firstVoicedIdx = i;
+      }
+      lastVoicedIdx = i + windowSize;
+    }
+  }
+
+  // If no speech found, return buffer as-is (let downstream silence analyzer handle)
+  if (firstVoicedIdx === -1) {
+    return buffer;
+  }
+
+  const leadingPadSamples = Math.round((leadingPadMs / 1000) * sampleRate);
+  const trailingPadSamples = Math.round((trailingPadMs / 1000) * sampleRate);
+
+  const startIdx = Math.max(0, firstVoicedIdx - leadingPadSamples);
+  const endIdx = Math.min(totalSamples, lastVoicedIdx + trailingPadSamples);
+
+  return buffer.subarray(startIdx, endIdx);
 }
 
 /**

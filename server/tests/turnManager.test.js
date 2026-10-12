@@ -164,3 +164,123 @@ test('TurnManager - multilingual Marathi and Hindi command parsing and language 
   assert.ok(hiStopStatus, 'Should transition to IDLE on Hindi stop command (रुको)');
 });
 
+test('TurnManager - preserves response state and saves playback position on barge-in interrupt', async () => {
+  const turnManager = new TurnManager();
+  const sessionId = 'test_checkpoint_pos_' + Date.now();
+  await SessionController.getOrCreateSession(sessionId);
+  const events = [];
+  const sendEvent = (e) => events.push(e);
+
+  // Active turn with 3 segments
+  const abortController = new AbortController();
+  turnManager.activeTurns.set(sessionId, {
+    turnId: 'turn_cp_1',
+    sessionId,
+    inputType: 'text',
+    text: 'What is Node.js?',
+    abortController,
+    seq: 3,
+    nextSegmentIndex: 3,
+    generatedText: 'Node.js is a runtime. It uses V8. It powers backend servers.',
+    segments: [
+      { index: 0, text: 'Node.js is a runtime.' },
+      { index: 1, text: 'It uses V8.' },
+      { index: 2, text: 'It powers backend servers.' },
+    ],
+    isAborted: false,
+  });
+
+  // User listened to sentence 0 and sentence 1 before barging in
+  await turnManager.handleInterrupt({
+    sessionId,
+    turnId: 'turn_cp_1',
+    lastSpokenSegmentIndex: 1,
+    sendEvent,
+  });
+
+  // Verify checkpoint state
+  const session = await SessionController.getSessionData(sessionId);
+  assert.ok(session.pausedResponse, 'Paused response must be saved');
+  assert.equal(session.pausedResponse.sourceTurnId, 'turn_cp_1');
+  assert.equal(session.pausedResponse.lastSpokenSegmentIndex, 1, 'Confirmed spoken index must be 1');
+  assert.equal(session.pausedResponse.segments.length, 3);
+  assert.equal(session.pausedResponse.generatedText, 'Node.js is a runtime. It uses V8. It powers backend servers.');
+  assert.equal(session.pausedResponse.generationComplete, false);
+
+  // User says "continue"
+  const continueEvents = [];
+  await turnManager.handleContinue({
+    sessionId,
+    sourceTurnId: 'turn_cp_1',
+    lastSpokenSegmentIndex: 1,
+    sendEvent: (e) => continueEvents.push(e),
+  });
+
+  // Must emit unspoken segment 2 only (indices 0 and 1 were already confirmed spoken)
+  const emittedSegments = continueEvents.filter((e) => e.type === 'assistant_segment');
+  assert.ok(emittedSegments.some((s) => s.segmentIndex === 2 && s.text === 'It powers backend servers.'));
+  assert.ok(!emittedSegments.some((s) => s.segmentIndex === 0), 'Completed segment 0 must not be repeated');
+  assert.ok(!emittedSegments.some((s) => s.segmentIndex === 1), 'Completed segment 1 must not be repeated');
+});
+
+test('TurnManager - interruption during completed response playback preserves generated answer', async () => {
+  const turnManager = new TurnManager();
+  const sessionId = 'test_completed_barge_' + Date.now();
+  await SessionController.getOrCreateSession(sessionId);
+  const events = [];
+  const sendEvent = (e) => events.push(e);
+
+  // Turn finished LLM generation on server (activeTurn is no longer in activeTurns map)
+  await SessionController.updatePausedResponse(sessionId, {
+    sourceTurnId: 'turn_comp_1',
+    generatedText: 'First part here. Second part here. Final part here.',
+    language: 'en',
+    lastSpokenSegmentIndex: -1,
+    generationComplete: true,
+    segments: [
+      { index: 0, text: 'First part here.' },
+      { index: 1, text: 'Second part here.' },
+      { index: 2, text: 'Final part here.' },
+    ],
+    timestamp: Date.now(),
+  });
+
+  // Client was playing audio when user barged in after hearing first part (index 0)
+  await turnManager.handleInterrupt({
+    sessionId,
+    turnId: 'turn_comp_1',
+    lastSpokenSegmentIndex: 0,
+    sendEvent,
+  });
+
+  // State must NOT be blanked out!
+  const session = await SessionController.getSessionData(sessionId);
+  assert.ok(session.pausedResponse);
+  assert.equal(session.pausedResponse.sourceTurnId, 'turn_comp_1');
+  assert.equal(session.pausedResponse.generatedText, 'First part here. Second part here. Final part here.');
+  assert.equal(session.pausedResponse.generationComplete, true);
+  assert.equal(session.pausedResponse.lastSpokenSegmentIndex, 0);
+  assert.equal(session.pausedResponse.segments.length, 3);
+
+  // User says continue
+  const continueEvents = [];
+  await turnManager.handleContinue({
+    sessionId,
+    sourceTurnId: 'turn_comp_1',
+    lastSpokenSegmentIndex: 0,
+    sendEvent: (e) => continueEvents.push(e),
+  });
+
+  // Should play unspoken segments 1 and 2
+  const segments = continueEvents.filter((e) => e.type === 'assistant_segment');
+  assert.equal(segments.length, 2, 'Should emit exactly the 2 remaining segments');
+  assert.equal(segments[0].segmentIndex, 1);
+  assert.equal(segments[0].text, 'Second part here.');
+  assert.equal(segments[1].segmentIndex, 2);
+  assert.equal(segments[1].text, 'Final part here.');
+
+  const turnComplete = continueEvents.find((e) => e.type === 'turn_complete');
+  assert.ok(turnComplete, 'Should emit turn_complete');
+});
+
+

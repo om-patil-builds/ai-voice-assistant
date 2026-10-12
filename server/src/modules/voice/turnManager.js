@@ -9,6 +9,8 @@ export class TurnManager {
   constructor() {
     // Map of sessionId/connectionId -> activeTurnState
     this.activeTurns = new Map();
+    // Cache of recently processed turns to prevent duplicate LLM calls
+    this.processedTurns = new Map();
   }
 
   /**
@@ -49,6 +51,23 @@ export class TurnManager {
    */
   async startTurn({ sessionId, turnId, text, inputType = 'text', language, sendEvent }) {
     if (!text || !text.trim()) return;
+
+    // Deduplicate rapid duplicate turn requests for the same turnId
+    const now = Date.now();
+    const turnKey = `${sessionId}:${turnId}`;
+    if (this.processedTurns.has(turnKey) && now - this.processedTurns.get(turnKey) < 2000) {
+      logger.warn(`Ignoring duplicate startTurn request for turnId ${turnId}`);
+      return;
+    }
+    this.processedTurns.set(turnKey, now);
+
+    // Prune stale entries
+    if (this.processedTurns.size > 100) {
+      for (const [k, ts] of this.processedTurns.entries()) {
+        if (now - ts > 30000) this.processedTurns.delete(k);
+      }
+    }
+
     const cleanText = normalizeTechTerms(text.trim());
     const detectedLang = detectLanguage(cleanText, language);
 
@@ -100,6 +119,12 @@ export class TurnManager {
     // Exclude the current user prompt from history since we append it freshly
     const contextMessages = history.slice(0, -1);
     contextMessages.push({ role: 'user', content: cleanText });
+
+    // Check if turn was aborted or superseded before starting LLM stream
+    if (abortController.signal.aborted || turnState.isAborted || this.activeTurns.get(sessionId)?.turnId !== turnId) {
+      logger.debug(`Turn ${turnId} was superseded or aborted before LLM start`);
+      return;
+    }
 
     // 7. Stream LLM text response
     try {
@@ -187,7 +212,7 @@ export class TurnManager {
         turnId,
         turnState.generatedText,
         'completed',
-        turnState.nextSegmentIndex - 1
+        -1
       );
 
       // Checkpoint full response
@@ -195,7 +220,7 @@ export class TurnManager {
         sourceTurnId: turnId,
         generatedText: turnState.generatedText,
         language: detectedLang,
-        lastSpokenSegmentIndex: turnState.nextSegmentIndex - 1,
+        lastSpokenSegmentIndex: -1,
         generationComplete: true,
         segments: turnState.segments,
         timestamp: Date.now(),
@@ -229,14 +254,17 @@ export class TurnManager {
    *
    * @param {Object} params
    * @param {string} params.sessionId
-   * @param {string} params.turnId
+   * @param {string} [params.turnId]
+   * @param {number} [params.lastSpokenSegmentIndex]
    * @param {function(Object): void} params.sendEvent
    */
-  async handleInterrupt({ sessionId, turnId, sendEvent }) {
+  async handleInterrupt({ sessionId, turnId, lastSpokenSegmentIndex, sendEvent }) {
     const activeTurn = this.activeTurns.get(sessionId);
 
     let interruptedText = '';
     let segments = [];
+    let isComplete = false;
+    let language = 'en';
     const sourceId = turnId || activeTurn?.turnId || null;
 
     if (activeTurn && (!turnId || activeTurn.turnId === turnId)) {
@@ -244,20 +272,47 @@ export class TurnManager {
       if (activeTurn.abortController && !activeTurn.abortController.signal.aborted) {
         activeTurn.abortController.abort();
       }
-      interruptedText = activeTurn.generatedText;
-      segments = activeTurn.segments;
+      if (activeTurn.previousGeneratedText) {
+        interruptedText = activeTurn.generatedText
+          ? `${activeTurn.previousGeneratedText} ${activeTurn.generatedText}`.trim()
+          : activeTurn.previousGeneratedText;
+      } else {
+        interruptedText = activeTurn.generatedText || '';
+      }
+      segments = [...(activeTurn.previousSegments || []), ...(activeTurn.segments || [])];
+      language = activeTurn.language || detectLanguage(interruptedText);
+      isComplete = false;
       this.activeTurns.delete(sessionId);
+    } else {
+      // LLM generation had already completed on the server, but was interrupted during client playback
+      const sessionData = await SessionController.getSessionData(sessionId);
+      const existingPaused = sessionData?.pausedResponse;
+      if (existingPaused && (!sourceId || existingPaused.sourceTurnId === sourceId || !turnId)) {
+        interruptedText = existingPaused.generatedText || '';
+        segments = existingPaused.segments || [];
+        language = existingPaused.language || detectLanguage(interruptedText);
+        isComplete = Boolean(existingPaused.generationComplete);
+      }
     }
 
     logger.info(`Turn ${sourceId} interrupted by user barge-in`);
+
+    // Determine accurate confirmed last spoken segment index
+    let resolvedLastSpoken = -1;
+    if (typeof lastSpokenSegmentIndex === 'number') {
+      resolvedLastSpoken = lastSpokenSegmentIndex;
+    } else {
+      const sessionData = await SessionController.getSessionData(sessionId);
+      resolvedLastSpoken = sessionData?.pausedResponse?.lastSpokenSegmentIndex ?? -1;
+    }
 
     // Checkpoint interrupted state for subsequent "continue"
     const pausedState = {
       sourceTurnId: sourceId,
       generatedText: interruptedText,
-      language: activeTurn?.language || detectLanguage(interruptedText),
-      lastSpokenSegmentIndex: -1,
-      generationComplete: false,
+      language,
+      lastSpokenSegmentIndex: resolvedLastSpoken,
+      generationComplete: isComplete,
       segments,
       timestamp: Date.now(),
     };
@@ -270,7 +325,7 @@ export class TurnManager {
         sourceId,
         interruptedText,
         'interrupted',
-        -1
+        resolvedLastSpoken
       );
     }
 
@@ -283,11 +338,9 @@ export class TurnManager {
    *
    * @param {Object} params
    * @param {string} params.sessionId
-   * @param {Object} params
-   * @param {string} params.sessionId
    * @param {string} [params.turnId]
-   * @param {string} params.sourceTurnId
-   * @param {number} params.lastSpokenSegmentIndex
+   * @param {string} [params.sourceTurnId]
+   * @param {number} [params.lastSpokenSegmentIndex=-1]
    * @param {function(Object): void} params.sendEvent
    */
   async handleContinue({ sessionId, turnId, sourceTurnId, lastSpokenSegmentIndex = -1, sendEvent }) {
@@ -305,22 +358,39 @@ export class TurnManager {
       return;
     }
 
-    // Update confirmed spoken index
-    paused.lastSpokenSegmentIndex = lastSpokenSegmentIndex;
+    // Determine accurate confirmed spoken index
+    let confirmedSpokenIndex = -1;
+    if (typeof lastSpokenSegmentIndex === 'number' && lastSpokenSegmentIndex >= 0) {
+      confirmedSpokenIndex = lastSpokenSegmentIndex;
+    } else if (typeof paused.lastSpokenSegmentIndex === 'number' && paused.lastSpokenSegmentIndex >= 0) {
+      confirmedSpokenIndex = paused.lastSpokenSegmentIndex;
+    }
+    paused.lastSpokenSegmentIndex = confirmedSpokenIndex;
+
     const continuationLanguage = paused.language || detectLanguage(paused.generatedText) || 'en';
+    const effectiveSourceId = sourceTurnId || paused.sourceTurnId;
 
     const remainingSegments = (paused.segments || []).filter(
-      (s) => s.index > lastSpokenSegmentIndex
+      (s) => s.index > confirmedSpokenIndex
     );
 
-    // If the generation was already finished, play out remaining segments
-    if (paused.generationComplete && remainingSegments.length > 0) {
+    // If the generation was already finished, play out remaining unspoken segments
+    if (paused.generationComplete) {
+      if (remainingSegments.length === 0) {
+        sendEvent({
+          type: 'error',
+          code: 'ALREADY_COMPLETED',
+          message: 'The response was already completed.',
+        });
+        return;
+      }
+
       sendEvent({ type: 'status', state: 'SPEAKING' });
 
       for (const seg of remainingSegments) {
         sendEvent({
           type: 'assistant_segment',
-          turnId: paused.sourceTurnId || sourceTurnId,
+          turnId: effectiveSourceId,
           segmentIndex: seg.index,
           text: seg.text,
           language: continuationLanguage,
@@ -329,18 +399,31 @@ export class TurnManager {
 
       sendEvent({
         type: 'turn_complete',
-        turnId: paused.sourceTurnId || sourceTurnId,
+        turnId: effectiveSourceId,
         language: continuationLanguage,
       });
 
-      await SessionController.updateStatus(sessionId, 'LISTENING');
-      sendEvent({ type: 'status', state: 'LISTENING' });
+      await SessionController.saveAssistantMessage(
+        sessionId,
+        effectiveSourceId,
+        paused.generatedText,
+        'completed',
+        confirmedSpokenIndex
+      );
+
       return;
     }
 
     // If generation was interrupted mid-stream, request continuation from LLM
     const continuationTurnId = turnId || ('turn_' + Math.random().toString(36).substring(2, 10));
     const abortController = new AbortController();
+
+    const maxExistingSegmentIndex =
+      paused.segments && paused.segments.length > 0
+        ? Math.max(...paused.segments.map((s) => s.index))
+        : -1;
+    const nextSegmentIndex = Math.max(confirmedSpokenIndex + 1, maxExistingSegmentIndex + 1);
+
     const turnState = {
       turnId: continuationTurnId,
       sessionId,
@@ -349,17 +432,37 @@ export class TurnManager {
       language: continuationLanguage,
       abortController,
       seq: 0,
-      nextSegmentIndex: Math.max(0, lastSpokenSegmentIndex + 1),
+      nextSegmentIndex,
       generatedText: '',
       segments: [],
+      previousGeneratedText: paused.generatedText || '',
+      previousSegments: paused.segments || [],
       isAborted: false,
     };
     this.activeTurns.set(sessionId, turnState);
 
-    sendEvent({ type: 'status', state: 'THINKING' });
+    // If there were unspoken segments already generated before the cutoff, emit them first
+    if (remainingSegments.length > 0) {
+      sendEvent({ type: 'status', state: 'SPEAKING' });
+      for (const seg of remainingSegments) {
+        sendEvent({
+          type: 'assistant_segment',
+          turnId: continuationTurnId,
+          segmentIndex: seg.index,
+          text: seg.text,
+          language: continuationLanguage,
+        });
+      }
+    } else {
+      sendEvent({ type: 'status', state: 'THINKING' });
+    }
 
     try {
       const history = await SessionController.getConversationHistory(sessionId, 6);
+      if (abortController.signal.aborted || turnState.isAborted || this.activeTurns.get(sessionId)?.turnId !== continuationTurnId) {
+        logger.debug(`Continuation turn ${continuationTurnId} aborted or superseded before LLM start`);
+        return;
+      }
       const tokenStream = streamContinuationCompletion({
         conversationHistory: history,
         generatedTextPrefix: paused.generatedText,
@@ -391,6 +494,7 @@ export class TurnManager {
         sentenceRegex.lastIndex = 0;
 
         while ((match = sentenceRegex.exec(streamBuffer)) !== null) {
+          if (abortController.signal.aborted || turnState.isAborted) return;
           const sentence = streamBuffer.slice(lastIndex, match.index + match[1].length).trim();
           lastIndex = match.index + match[0].length;
 
@@ -433,15 +537,18 @@ export class TurnManager {
       });
 
       const fullCombinedText = paused.generatedText
-        ? `${paused.generatedText} ${turnState.generatedText}`
+        ? `${paused.generatedText} ${turnState.generatedText}`.trim()
         : turnState.generatedText;
+
+      const allSegments = [...(paused.segments || []), ...turnState.segments];
 
       await SessionController.saveAssistantMessage(
         sessionId,
         continuationTurnId,
         fullCombinedText,
         'completed',
-        turnState.nextSegmentIndex - 1
+        confirmedSpokenIndex,
+        effectiveSourceId
       );
 
       // Checkpoint updated response
@@ -449,9 +556,9 @@ export class TurnManager {
         sourceTurnId: continuationTurnId,
         generatedText: fullCombinedText,
         language: continuationLanguage,
-        lastSpokenSegmentIndex: turnState.nextSegmentIndex - 1,
+        lastSpokenSegmentIndex: confirmedSpokenIndex,
         generationComplete: true,
-        segments: [...(paused.segments || []), ...turnState.segments],
+        segments: allSegments,
         timestamp: Date.now(),
       });
 

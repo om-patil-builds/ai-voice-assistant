@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { VoiceActivityDetector } from '../src/audio/vad.js';
 import { PlaybackCursor } from '../src/audio/playbackCursor.js';
 import { parseVoiceCommand, SESSION_STATES } from '../src/hooks/useVoiceSession.js';
 import { SocketClient } from '../src/services/socketClient.js';
@@ -430,4 +431,208 @@ test('TechTermNormalizer (client) - normalizes English and Devanagari developer 
   assert.equal(isTechnicalTermQuery('मर्न स्टॅक'), true);
   assert.equal(isTechnicalTermQuery('hello there'), false);
 });
+
+test('VoiceActivityDetector - configurable playback thresholds and duration', () => {
+  const vad = new VoiceActivityDetector({
+    speechThreshold: 0.02,
+    playbackSpeechThreshold: 0.035,
+    playbackMinSpeechDurationMs: 100,
+  });
+
+  assert.equal(vad.speechThreshold, 0.02);
+  assert.equal(vad.playbackSpeechThreshold, 0.035);
+  assert.equal(vad.playbackMinSpeechDurationMs, 100);
+
+  vad.setPlaybackSpeechThreshold(0.04);
+  assert.equal(vad.playbackSpeechThreshold, 0.04);
+
+  vad.setPlaybackMinSpeechDuration(120);
+  assert.equal(vad.playbackMinSpeechDurationMs, 120);
+});
+
+test('VoiceActivityDetector - setPlaybackActive only updates playbackStartTime on transition', () => {
+  const vad = new VoiceActivityDetector();
+  assert.equal(vad.isPlaybackActive, false);
+  assert.equal(vad.playbackStartTime, 0);
+
+  vad.setPlaybackActive(true);
+  assert.equal(vad.isPlaybackActive, true);
+  const initialStartTime = vad.playbackStartTime;
+  assert.ok(initialStartTime > 0);
+
+  // Calling setPlaybackActive(true) repeatedly must NOT reset playbackStartTime
+  vad.setPlaybackActive(true);
+  assert.equal(vad.playbackStartTime, initialStartTime, 'playbackStartTime must remain stable when already active');
+
+  vad.setPlaybackActive(false);
+  assert.equal(vad.isPlaybackActive, false);
+
+  vad.setPlaybackActive(true);
+  assert.ok(vad.playbackStartTime >= initialStartTime, 'playbackStartTime must update on fresh transition');
+});
+
+test('VoiceActivityDetector - _processAudioFrame detects speech under playback with realistic threshold', () => {
+  let speechStarted = false;
+  const vad = new VoiceActivityDetector({
+    speechThreshold: 0.022,
+    playbackSpeechThreshold: 0.035,
+    playbackMinSpeechDurationMs: 100,
+    onSpeechStart: () => {
+      speechStarted = true;
+    },
+  });
+
+  vad.isListening = true;
+  vad.setPlaybackActive(true);
+  // Fast forward past startup ducking window (120ms)
+  vad.playbackStartTime = performance.now() - 500;
+
+  // Generate PCM frame with RMS ~0.050 (above playbackSpeechThreshold 0.035, below old hardcoded 0.065)
+  const sampleCount = 4096;
+  const frame = new Float32Array(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    frame[i] = 0.07 * Math.sin((i / 48000) * 2 * Math.PI * 440);
+  }
+
+  // First frame: initiates candidate speech onset
+  vad._processAudioFrame(frame);
+  assert.equal(speechStarted, false, 'Speech should not confirm immediately on first frame');
+  assert.ok(vad.candidateSpeechStart > 0, 'candidateSpeechStart must be recorded');
+
+  // Fast forward time past playbackMinSpeechDurationMs (100ms)
+  vad.candidateSpeechStart = performance.now() - 150;
+
+  // Second frame: sustained duration met -> speech onset confirmed!
+  vad._processAudioFrame(frame);
+  assert.equal(speechStarted, true, 'Speech must be confirmed and trigger onSpeechStart callback');
+  assert.equal(vad.isSpeaking, true);
+});
+
+test('Regression: Silence does not interrupt playback', () => {
+  let interrupted = false;
+  const vad = new VoiceActivityDetector({
+    onSpeechStart: () => {
+      interrupted = true;
+    },
+  });
+
+  vad.isListening = true;
+  vad.setPlaybackActive(true);
+  vad.playbackStartTime = performance.now() - 500; // Past startup ducking window
+
+  const sampleCount = 4096;
+  const silenceFrame = new Float32Array(sampleCount); // All zeros
+
+  // Feed 15 silence frames (~1.2 seconds of silence)
+  for (let i = 0; i < 15; i++) {
+    vad._processAudioFrame(silenceFrame);
+  }
+
+  assert.equal(interrupted, false, 'Silence must never trigger speech start or barge-in interruption');
+  assert.equal(vad.isSpeaking, false, 'VAD should remain in not-speaking state during silence');
+  assert.equal(vad.candidateSpeechStart, 0, 'candidateSpeechStart should remain 0');
+});
+
+test('Regression: Low-level background noise and speaker echo do not interrupt playback', () => {
+  let interrupted = false;
+  const vad = new VoiceActivityDetector({
+    onSpeechStart: () => {
+      interrupted = true;
+    },
+  });
+
+  vad.isListening = true;
+  vad.setPlaybackActive(true);
+  vad.playbackStartTime = performance.now() - 500;
+
+  const sampleCount = 4096;
+  // Ambient room noise / speaker echo (RMS ~0.025 - 0.035, below playback threshold of 0.060)
+  const noiseFrame = new Float32Array(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    noiseFrame[i] = 0.035 * Math.sin((i / 48000) * 2 * Math.PI * 300);
+  }
+
+  // Feed 12 frames of continuous background noise (~1.0 second)
+  for (let i = 0; i < 12; i++) {
+    vad._processAudioFrame(noiseFrame);
+  }
+
+  assert.equal(interrupted, false, 'Continuous background noise must not trigger barge-in during playback');
+  assert.equal(vad.isSpeaking, false);
+  assert.equal(vad.candidateSpeechStart, 0);
+
+  // Test isolated transient pop: 1 frame at 0.070 RMS followed by noise
+  const spikeFrame = new Float32Array(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    spikeFrame[i] = 0.10 * Math.sin((i / 48000) * 2 * Math.PI * 440);
+  }
+  vad._processAudioFrame(spikeFrame);
+  assert.equal(interrupted, false, 'Single transient frame must not confirm speech');
+  assert.ok(vad.candidateSpeechStart > 0, 'Spike initiates candidate onset');
+
+  // Next frame drops back to noise level -> candidate onset must be immediately reset!
+  vad._processAudioFrame(noiseFrame);
+  assert.equal(vad.candidateSpeechStart, 0, 'Candidate speech onset must reset when energy drops below threshold');
+  assert.equal(interrupted, false, 'Barge-in must not trigger on isolated transient');
+});
+
+test('Regression: Genuine user speech interrupts playback', () => {
+  let interrupted = false;
+  const vad = new VoiceActivityDetector({
+    onSpeechStart: () => {
+      interrupted = true;
+    },
+  });
+
+  vad.isListening = true;
+  vad.setPlaybackActive(true);
+  vad.playbackStartTime = performance.now() - 500;
+
+  const sampleCount = 4096;
+  // Genuine speech frame: clear voice at ~0.10 RMS (well above playback threshold 0.060)
+  const speechFrame = new Float32Array(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    speechFrame[i] = 0.14 * Math.sin((i / 48000) * 2 * Math.PI * 250);
+  }
+
+  // Frame 1: speech onset begins
+  vad._processAudioFrame(speechFrame);
+  assert.equal(interrupted, false, 'Barge-in should not trigger before minimum sustained duration');
+  assert.ok(vad.candidateSpeechStart > 0, 'Candidate speech onset marked');
+
+  // Advance time past playbackMinSpeechDurationMs (default 180ms)
+  vad.candidateSpeechStart = performance.now() - 220;
+
+  // Frame 2: sustained speech confirmed!
+  vad._processAudioFrame(speechFrame);
+  assert.equal(interrupted, true, 'Genuine speech sustained for required duration must trigger barge-in');
+  assert.equal(vad.isSpeaking, true);
+});
+
+test('Regression: Microphone monitoring remains active during playback', () => {
+  let levelReported = null;
+  const vad = new VoiceActivityDetector({
+    onAudioLevel: (lvl) => {
+      levelReported = lvl;
+    },
+  });
+
+  vad.isListening = true;
+  vad.setPlaybackActive(true);
+
+  assert.equal(vad.isListening, true, 'VAD isListening must remain true during playback');
+  assert.equal(vad.isPlaybackActive, true, 'isPlaybackActive must be true');
+
+  // Feed an audio frame and verify audio level monitoring still functions
+  const sampleCount = 4096;
+  const frame = new Float32Array(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    frame[i] = 0.05 * Math.sin((i / 48000) * 2 * Math.PI * 440);
+  }
+
+  vad._processAudioFrame(frame);
+  assert.ok(levelReported !== null && levelReported > 0, 'Audio level visualizer must remain active during playback');
+  assert.ok(vad.preRollChunks.length > 0, 'Audio frames must continue buffering in pre-roll during playback');
+});
+
 

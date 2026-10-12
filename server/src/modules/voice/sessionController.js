@@ -176,16 +176,22 @@ export class SessionController {
    * @param {string} text
    * @param {'streaming'|'completed'|'interrupted'|'resumed'} status
    * @param {number} [lastSpokenSegmentIndex=-1]
+   * @param {string} [sourceTurnId=null]
    */
-  static async saveAssistantMessage(sessionId, turnId, text, status = 'completed', lastSpokenSegmentIndex = -1) {
+  static async saveAssistantMessage(sessionId, turnId, text, status = 'completed', lastSpokenSegmentIndex = -1, sourceTurnId = null) {
     const timestamp = Date.now();
 
     if (isMongoConnected()) {
       try {
+        const query = sourceTurnId
+          ? { sessionId, sender: 'assistant', $or: [{ turnId }, { turnId: sourceTurnId }] }
+          : { sessionId, turnId, sender: 'assistant' };
+
         await Message.findOneAndUpdate(
-          { sessionId, turnId, sender: 'assistant' },
+          query,
           {
             $set: {
+              turnId,
               text,
               status,
               lastSpokenSegmentIndex,
@@ -206,8 +212,11 @@ export class SessionController {
     }
 
     const list = memoryMessages.get(sessionId) || [];
-    const existing = list.find((m) => m.turnId === turnId && m.sender === 'assistant');
+    const existing = list.find(
+      (m) => m.sender === 'assistant' && (m.turnId === turnId || (sourceTurnId && m.turnId === sourceTurnId))
+    );
     if (existing) {
+      existing.turnId = turnId;
       existing.text = text;
       existing.status = status;
       existing.lastSpokenSegmentIndex = lastSpokenSegmentIndex;

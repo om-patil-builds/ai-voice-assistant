@@ -76,6 +76,11 @@ router.post('/', rateLimitMiddleware, upload.single('audio'), async (req, res, n
       }
     });
 
+    logger.info(
+      `[REST /api/transcriptions] Incoming upload: filename=${req.file.originalname}, mimetype=${req.file.mimetype}, size=${req.file.buffer.length} bytes`
+    );
+
+    const routeStart = Date.now();
     const result = await transcribeAudio(req.file.buffer, {
       filename: req.file.originalname || 'speech.webm',
       mimetype: req.file.mimetype || 'audio/webm',
@@ -83,6 +88,9 @@ router.post('/', rateLimitMiddleware, upload.single('audio'), async (req, res, n
     });
 
     clearTimeout(timeout);
+    logger.info(
+      `[REST /api/transcriptions] Handled in ${Date.now() - routeStart}ms | Transcript: "${result.transcript}"`
+    );
     return res.status(200).json(result);
   } catch (err) {
     if (err instanceof RateLimitError) {

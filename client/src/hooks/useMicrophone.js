@@ -12,7 +12,10 @@ import { VoiceActivityDetector } from '../audio/vad.js';
  * @param {function(Error): void} [options.onError] - (error) => void
  */
 export function useMicrophone({
-  silenceTimeoutMs = 550,
+  silenceTimeoutMs = 700,
+  speechThreshold = 0.020,
+  playbackSpeechThreshold = 0.060,
+  playbackMinSpeechDurationMs = 180,
   onSpeechStart,
   onUtteranceRecorded,
   onError,
@@ -104,6 +107,9 @@ export function useMicrophone({
       if (!vadRef.current) {
         vadRef.current = new VoiceActivityDetector({
           silenceTimeoutMs,
+          speechThreshold,
+          playbackSpeechThreshold,
+          playbackMinSpeechDurationMs,
           onSpeechStart: handleVADSpeechStart,
           onSpeechEnd: handleVADSpeechEnd,
           onAudioLevel: (lvl) => setAudioLevel(lvl),
@@ -114,6 +120,9 @@ export function useMicrophone({
         });
       } else {
         vadRef.current.setSilenceTimeout(silenceTimeoutMs);
+        vadRef.current.setSpeechThreshold(speechThreshold);
+        vadRef.current.setPlaybackSpeechThreshold(playbackSpeechThreshold);
+        vadRef.current.setPlaybackMinSpeechDuration(playbackMinSpeechDurationMs);
       }
 
       vadRef.current.start(stream);
@@ -136,7 +145,15 @@ export function useMicrophone({
       if (onErrorRef.current) onErrorRef.current(new Error(message));
       return false;
     }
-  }, [isSupported, silenceTimeoutMs, handleVADSpeechStart, handleVADSpeechEnd]);
+  }, [
+    isSupported,
+    silenceTimeoutMs,
+    speechThreshold,
+    playbackSpeechThreshold,
+    playbackMinSpeechDurationMs,
+    handleVADSpeechStart,
+    handleVADSpeechEnd,
+  ]);
 
   /**
    * Stop listening to the microphone
@@ -174,6 +191,15 @@ export function useMicrophone({
     }
   }, []);
 
+  /**
+   * Dynamically adjust playback speech threshold
+   */
+  const setPlaybackSpeechThreshold = useCallback((threshold) => {
+    if (vadRef.current) {
+      vadRef.current.setPlaybackSpeechThreshold(threshold);
+    }
+  }, []);
+
   // Cleanup on unmount
   useEffect(() => {
     return () => {
@@ -198,5 +224,6 @@ export function useMicrophone({
     stopListening,
     setPlaybackActive,
     updateSilenceTimeout,
+    setPlaybackSpeechThreshold,
   };
 }
