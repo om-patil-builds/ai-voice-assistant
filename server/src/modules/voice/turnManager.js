@@ -260,6 +260,9 @@ export class TurnManager {
    */
   async handleInterrupt({ sessionId, turnId, lastSpokenSegmentIndex, sendEvent }) {
     const activeTurn = this.activeTurns.get(sessionId);
+    logger.info(
+      `[Server Trace] handleInterrupt called | sessionId=${sessionId} | turnId=${turnId} | lastSpokenIndex=${lastSpokenSegmentIndex} | activeTurn=${Boolean(activeTurn)}`
+    );
 
     let interruptedText = '';
     let segments = [];

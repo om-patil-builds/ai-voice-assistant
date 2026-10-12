@@ -126,20 +126,27 @@ export function useVoiceSession() {
    */
   const handleBargeIn = useCallback(() => {
     const isPlayingAudio =
-      status === SESSION_STATES.SPEAKING || Boolean(ttsPlayerRef.current?.isSpeaking);
+      status === SESSION_STATES.SPEAKING ||
+      Boolean(ttsPlayerRef.current?.isSpeaking) ||
+      Boolean(ttsPlayerRef.current?.queue?.length > 0);
 
     console.log(
-      '[BargeIn] handleBargeIn called | isPlayingAudio:',
+      '[BargeIn Trace] handleBargeIn invoked | isPlayingAudio:',
       isPlayingAudio,
       'turnId:',
       activeTurnIdRef.current,
       'status:',
-      status
+      status,
+      'playerSpeaking:',
+      Boolean(ttsPlayerRef.current?.isSpeaking),
+      'playerQueue:',
+      ttsPlayerRef.current?.queue?.length || 0
     );
 
     // Only barge in if the assistant is actively speaking audio!
     // Do NOT cancel during THINKING or TRANSCRIBING because normal user breaths or ambient noise would kill the generation.
     if (isPlayingAudio) {
+      console.log('[BargeIn Trace] Executing barge-in interruption!');
       // Abort any in-flight HTTP STT requests
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
@@ -183,6 +190,8 @@ export function useVoiceSession() {
 
       // 6. Transition state
       setStatus(SESSION_STATES.INTERRUPTED);
+    } else {
+      console.log('[BargeIn Trace] Barge-in skipped: assistant is not speaking audio');
     }
   }, [status]);
 
@@ -566,6 +575,9 @@ export function useVoiceSession() {
    */
   const microphone = useMicrophone({
     silenceTimeoutMs,
+    speechThreshold: 0.020,
+    playbackSpeechThreshold: 0.035,
+    playbackMinSpeechDurationMs: 100,
     onSpeechStart: handleBargeIn,
     onUtteranceRecorded: handleUtteranceRecorded,
     onError: (err) => {
@@ -577,7 +589,13 @@ export function useVoiceSession() {
   // Keep VAD updated when assistant is actively speaking through speakers
   const { setPlaybackActive } = microphone;
   useEffect(() => {
-    const isSpeaking = status === SESSION_STATES.SPEAKING || Boolean(ttsPlayerRef.current?.isSpeaking);
+    const isSpeaking =
+      status === SESSION_STATES.SPEAKING ||
+      Boolean(ttsPlayerRef.current?.isSpeaking) ||
+      Boolean(ttsPlayerRef.current?.queue?.length > 0);
+    console.log(
+      `[useVoiceSession Trace] setPlaybackActive(${isSpeaking}) | status=${status} | ttsSpeaking=${Boolean(ttsPlayerRef.current?.isSpeaking)} | queueLen=${ttsPlayerRef.current?.queue?.length || 0}`
+    );
     setPlaybackActive(isSpeaking);
   }, [status, setPlaybackActive]);
 
@@ -759,9 +777,17 @@ export function useVoiceSession() {
     // Handle server status updates
     const unsubStatus = socketClient.on('status', (data) => {
       if (data.state && SESSION_STATES[data.state]) {
-        if (data.state === SESSION_STATES.LISTENING && ttsPlayerRef.current?.isSpeaking) {
+        if (
+          data.state === SESSION_STATES.LISTENING &&
+          (ttsPlayerRef.current?.isSpeaking ||
+            (ttsPlayerRef.current?.queue && ttsPlayerRef.current.queue.length > 0))
+        ) {
+          console.log(
+            '[useVoiceSession Trace] Ignored premature server status: LISTENING because TTS audio playback or queue is still active'
+          );
           return;
         }
+        console.log(`[useVoiceSession Trace] Received server status update: ${data.state}`);
         setStatus(data.state);
       }
     });

@@ -253,6 +253,9 @@ export class SocketClient {
     if (typeof lastSpokenSegmentIndex === 'number') {
       payload.lastSpokenSegmentIndex = lastSpokenSegmentIndex;
     }
+    console.log(
+      `[SocketClient Trace] Emitting "interrupt" event | turnId=${turnId} | lastSpokenIndex=${lastSpokenSegmentIndex}`
+    );
     return this.send(payload);
   }
 

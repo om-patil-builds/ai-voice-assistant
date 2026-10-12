@@ -30,8 +30,8 @@ export class VoiceActivityDetector {
     this.silenceThreshold = options.silenceThreshold ?? 0.010;
     this.silenceTimeoutMs = options.silenceTimeoutMs ?? 700;
     this.minSpeechDurationMs = options.minSpeechDurationMs ?? 120;
-    this.playbackSpeechThreshold = options.playbackSpeechThreshold ?? 0.060;
-    this.playbackMinSpeechDurationMs = options.playbackMinSpeechDurationMs ?? 180;
+    this.playbackSpeechThreshold = options.playbackSpeechThreshold ?? 0.035;
+    this.playbackMinSpeechDurationMs = options.playbackMinSpeechDurationMs ?? 100;
 
     this.onSpeechStart = options.onSpeechStart || (() => {});
     this.onSpeechEnd = options.onSpeechEnd || (() => {});
@@ -73,7 +73,11 @@ export class VoiceActivityDetector {
     if (this.isPlaybackActive && !wasActive) {
       this.playbackStartTime = typeof performance !== 'undefined' ? performance.now() : Date.now();
     }
-    console.log(`[VAD] setPlaybackActive(${active}) | wasActive=${wasActive}`);
+    const currentThreshold = this.isPlaybackActive ? this.playbackSpeechThreshold : this.speechThreshold;
+    const currentMinDuration = this.isPlaybackActive ? this.playbackMinSpeechDurationMs : this.minSpeechDurationMs;
+    console.log(
+      `[VAD Trace] setPlaybackActive(${active}) | wasActive=${wasActive} | effectiveThreshold=${currentThreshold.toFixed(4)} | minDuration=${currentMinDuration}ms`
+    );
   }
 
   /**
@@ -263,14 +267,18 @@ registerProcessor('vad-processor', VadProcessor);
       if (!this.isSpeaking) {
         if (!this.candidateSpeechStart) {
           this.candidateSpeechStart = now;
-          console.log(`[VAD] Candidate speech onset | rms=${rms.toFixed(4)} | threshold=${effectiveSpeechThreshold.toFixed(4)} | playbackActive=${this.isPlaybackActive}`);
+          console.log(
+            `[VAD Trace] Candidate speech onset | rms=${rms.toFixed(4)} >= threshold=${effectiveSpeechThreshold.toFixed(4)} | playbackActive=${this.isPlaybackActive} | minDuration=${effectiveMinDuration}ms`
+          );
         } else if (now - this.candidateSpeechStart >= effectiveMinDuration) {
           // Sustained speech confirmed!
           this.isSpeaking = true;
           this.speechStartTime = this.candidateSpeechStart;
           this.candidateSpeechStart = 0;
 
-          console.log(`[VAD] Speech confirmed (Barge-in)! | rms=${rms.toFixed(4)} | duration=${Math.round(now - this.speechStartTime)}ms | playbackActive=${this.isPlaybackActive}`);
+          console.log(
+            `[VAD Trace] Speech confirmed (Barge-in)! | rms=${rms.toFixed(4)} | duration=${Math.round(now - this.speechStartTime)}ms >= required=${effectiveMinDuration}ms | playbackActive=${this.isPlaybackActive}`
+          );
 
           // Barge-in: Notify caller immediately to stop AI playback and cancel LLM stream!
           this.onSpeechStart();
@@ -278,6 +286,10 @@ registerProcessor('vad-processor', VadProcessor);
           // Initialize speech recording with ALL pre-roll frames!
           // This guarantees that initial sounds ("H" in "Hey", consonants) are preserved!
           this.recordedSpeechChunks = [...this.preRollChunks];
+        } else {
+          console.log(
+            `[VAD Trace] Candidate speech sustaining | rms=${rms.toFixed(4)} | elapsed=${Math.round(now - this.candidateSpeechStart)}ms / required=${effectiveMinDuration}ms | playbackActive=${this.isPlaybackActive}`
+          );
         }
       } else {
         // Continue recording speech
@@ -288,6 +300,11 @@ registerProcessor('vad-processor', VadProcessor);
       // Crucial: If speech was NOT yet confirmed, any drop below speech threshold immediately resets candidate onset.
       // This prevents momentary clicks, isolated pops, or speaker echo syllables from accumulating across frames.
       if (!this.isSpeaking) {
+        if (this.candidateSpeechStart) {
+          console.log(
+            `[VAD Trace] Candidate speech reset | rms=${rms.toFixed(4)} < threshold=${effectiveSpeechThreshold.toFixed(4)} | candidateDuration=${Math.round(now - this.candidateSpeechStart)}ms < required=${effectiveMinDuration}ms | playbackActive=${this.isPlaybackActive}`
+          );
+        }
         this.candidateSpeechStart = 0;
       } else {
         // Speech is already confirmed (isSpeaking === true)

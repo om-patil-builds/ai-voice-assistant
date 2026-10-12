@@ -635,4 +635,97 @@ test('Regression: Microphone monitoring remains active during playback', () => {
   assert.ok(vad.preRollChunks.length > 0, 'Audio frames must continue buffering in pre-roll during playback');
 });
 
+test('Regression: Conversational-volume speech (RMS 0.040-0.050) reliably triggers barge-in under default settings', () => {
+  let bargeInFired = false;
+  // Use default options - no custom thresholds passed
+  const vad = new VoiceActivityDetector({
+    onSpeechStart: () => {
+      bargeInFired = true;
+    },
+  });
+
+  vad.isListening = true;
+  vad.setPlaybackActive(true);
+  vad.playbackStartTime = performance.now() - 500; // Past startup ducking window
+
+  const sampleCount = 4096;
+  // Conversational speech frame at amplitude 0.065 -> RMS = 0.065 / sqrt(2) ≈ 0.0460
+  // (Previously failed under old 0.060 threshold; now reliably detected under 0.035 threshold)
+  const speechFrame = new Float32Array(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    speechFrame[i] = 0.065 * Math.sin((i / 48000) * 2 * Math.PI * 300);
+  }
+
+  // Frame 1: Onset detection
+  vad._processAudioFrame(speechFrame);
+  assert.equal(bargeInFired, false, 'Barge-in should not trigger before min duration is met');
+  assert.ok(vad.candidateSpeechStart > 0, 'Candidate speech onset must be set for conversational speech');
+
+  // Advance time past default playbackMinSpeechDurationMs (100ms)
+  vad.candidateSpeechStart = performance.now() - 110;
+
+  // Frame 2: Sustained duration met -> Barge-in confirmed!
+  vad._processAudioFrame(speechFrame);
+  assert.equal(bargeInFired, true, 'Conversational speech (RMS ~0.046) must reliably interrupt assistant playback');
+  assert.equal(vad.isSpeaking, true);
+});
+
+test('Regression: Old audio is cancelled immediately upon barge-in and never restarts automatically', () => {
+  const ttsPlayer = new TTSPlayer();
+  ttsPlayer.resetForTurn('turn_barge_cancel_test');
+
+  // Enqueue multiple segments simulating a multi-sentence assistant response
+  ttsPlayer.enqueueSegment('Sentence one has started.', 0, 'turn_barge_cancel_test');
+  ttsPlayer.enqueueSegment('Sentence two is waiting in queue.', 1, 'turn_barge_cancel_test');
+  ttsPlayer.enqueueSegment('Sentence three should never be spoken.', 2, 'turn_barge_cancel_test');
+
+  // Confirm segment 0 was heard
+  ttsPlayer.lastConfirmedSegmentIndex = 0;
+
+  // User barges in -> cancel() is invoked
+  const cancelResult = ttsPlayer.cancel();
+
+  assert.equal(cancelResult.sourceTurnId, 'turn_barge_cancel_test');
+  assert.equal(cancelResult.lastSpokenSegmentIndex, 0);
+  assert.equal(ttsPlayer.queue.length, 0, 'Queue must be completely emptied upon barge-in');
+  assert.equal(ttsPlayer.isSpeaking, false, 'Player isSpeaking must be false');
+  assert.equal(ttsPlayer.cancelled, true, 'Player cancelled flag must be true');
+
+  // Attempt to feed late LLM delta tokens for this cancelled turn
+  ttsPlayer.feedDelta('Late tokens arriving from slow network.', 'turn_barge_cancel_test', false);
+  assert.equal(ttsPlayer.queue.length, 0, 'Late tokens from cancelled turn must never enqueue new audio');
+  assert.equal(ttsPlayer.isSpeaking, false, 'Player must remain silent');
+});
+
+test('Regression: Interrupted response can be resumed without repeating spoken audio', () => {
+  const cursor = new PlaybackCursor();
+  cursor.initTurn('turn_resume_test');
+  cursor.addSegment(0, 'First part of the answer.');
+  cursor.addSegment(1, 'Second part of the answer.');
+  cursor.addSegment(2, 'Third part of the answer.');
+
+  // User heard segment 0
+  cursor.confirmSegment(0);
+
+  // Barge-in occurs
+  const paused = cursor.savePausedState(
+    'turn_resume_test',
+    'First part of the answer. Second part of the answer. Third part of the answer.',
+    0,
+    true
+  );
+
+  assert.equal(paused.lastSpokenSegmentIndex, 0);
+  assert.equal(paused.generationComplete, true);
+
+  // Filter remaining unspoken segments for resume
+  const remaining = paused.segments.filter((s) => s.index > paused.lastSpokenSegmentIndex);
+  assert.equal(remaining.length, 2, 'Only unspoken segments (1 and 2) should remain');
+  assert.equal(remaining[0].index, 1);
+  assert.equal(remaining[1].index, 2);
+  assert.equal(remaining[0].text, 'Second part of the answer.');
+  assert.equal(remaining[1].text, 'Third part of the answer.');
+});
+
+
 
