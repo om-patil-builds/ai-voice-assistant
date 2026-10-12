@@ -31,17 +31,13 @@ export function VoiceControls({
   const [showSettings, setShowSettings] = useState(false);
 
   const handleTextSubmit = (e) => {
-    e.preventDefault();
-    if (!inputText.trim()) return;
-    onSendText(inputText.trim());
-    setInputText('');
-  };
-
-  const handleKeyDown = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e && typeof e.preventDefault === 'function') {
       e.preventDefault();
-      handleTextSubmit(e);
     }
+    const trimmed = inputText.trim();
+    if (!trimmed) return;
+    setInputText('');
+    onSendText(trimmed);
   };
 
   return (
@@ -255,7 +251,6 @@ export function VoiceControls({
             placeholder="Type your message or query here..."
             value={inputText}
             onChange={(e) => setInputText(e.target.value)}
-            onKeyDown={handleKeyDown}
             aria-label="Type message fallback"
           />
           <button

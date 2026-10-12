@@ -52,7 +52,7 @@ export function useVoiceSession() {
   const [isMuted, setIsMuted] = useState(false);
   const [errorMessage, setErrorMessage] = useState(null);
   const [connectionStatus, setConnectionStatus] = useState('disconnected');
-  const [silenceTimeoutMs, setSilenceTimeoutMs] = useState(600);
+  const [silenceTimeoutMs, setSilenceTimeoutMs] = useState(700);
   const [pausedResponse, setPausedResponse] = useState(null);
   const [ttsVolume, setTtsVolume] = useState(1.0);
   const [ttsRate, setTtsRate] = useState(1.0);
@@ -71,6 +71,7 @@ export function useVoiceSession() {
   const currentStreamingTextRef = useRef('');
   const turnStartTimeRef = useRef(0);
   const sttStartTimeRef = useRef(0);
+  const lastSubmittedTurnRef = useRef({ text: '', timestamp: 0 });
 
   const ttsPlayerRef = useRef(null);
   if (ttsPlayerRef.current == null) {
@@ -124,17 +125,27 @@ export function useVoiceSession() {
    * Called immediately when user speech onset is detected.
    */
   const handleBargeIn = useCallback(() => {
-    // Abort any in-flight HTTP STT requests
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
-    }
+    const isPlayingAudio =
+      status === SESSION_STATES.SPEAKING || Boolean(ttsPlayerRef.current?.isSpeaking);
 
-    const isPlayingAudio = ttsPlayerRef.current && (ttsPlayerRef.current.isSpeaking || status === SESSION_STATES.SPEAKING);
+    console.log(
+      '[BargeIn] handleBargeIn called | isPlayingAudio:',
+      isPlayingAudio,
+      'turnId:',
+      activeTurnIdRef.current,
+      'status:',
+      status
+    );
 
     // Only barge in if the assistant is actively speaking audio!
     // Do NOT cancel during THINKING or TRANSCRIBING because normal user breaths or ambient noise would kill the generation.
     if (isPlayingAudio) {
+      // Abort any in-flight HTTP STT requests
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+      }
+
       const turnId = activeTurnIdRef.current;
 
       // 1. Instantly stop browser TTS audio playback
@@ -165,9 +176,7 @@ export function useVoiceSession() {
       }
 
       // 4. Notify backend WebSocket to abort LLM generation
-      if (turnId) {
-        socketClient.interrupt(turnId, cancelResult.lastSpokenSegmentIndex);
-      }
+      socketClient.interrupt(turnId || undefined, cancelResult.lastSpokenSegmentIndex);
 
       // 5. Invalidate active turn so any late server tokens are rejected
       activeTurnIdRef.current = null;
@@ -364,6 +373,17 @@ export function useVoiceSession() {
 
     const trimmedText = normalizeTechTerms(text.trim());
 
+    // Debounce rapid duplicate submissions (e.g. key repeat or duplicate events)
+    const now = Date.now();
+    if (
+      lastSubmittedTurnRef.current.text === trimmedText &&
+      now - lastSubmittedTurnRef.current.timestamp < 600
+    ) {
+      console.warn('[useVoiceSession] Duplicate submission debounced:', trimmedText);
+      return;
+    }
+    lastSubmittedTurnRef.current = { text: trimmedText, timestamp: now };
+
     // Check for standalone voice command FIRST
     const command = parseVoiceCommand(trimmedText);
     if (command) {
@@ -470,7 +490,7 @@ export function useVoiceSession() {
    * Handle recorded audio utterance from useMicrophone
    */
   const handleUtteranceRecorded = useCallback(
-    async (blob) => {
+    async (blob, durationMs) => {
       setStatus(SESSION_STATES.TRANSCRIBING);
       sttStartTimeRef.current = performance.now();
 
@@ -481,6 +501,10 @@ export function useVoiceSession() {
       abortControllerRef.current = controller;
 
       try {
+        console.log(
+          `[STT Client Upload] Uploading audio: size=${blob?.size} bytes | duration=${durationMs || 'unknown'}ms`
+        );
+
         const result = await apiClient.uploadAudio(blob, 'speech.wav', {
           signal: controller.signal,
         });
@@ -489,8 +513,13 @@ export function useVoiceSession() {
         const sttLatency = Math.round(performance.now() - sttStartTimeRef.current);
         setTelemetry((prev) => ({ ...prev, sttLatencyMs: sttLatency }));
 
+        console.log(
+          `[STT Client Result] Transcription received in ${sttLatency}ms | Raw Transcript: "${transcript || ''}" | Lang: ${result?.language || 'unknown'}`
+        );
+
         if (!transcript) {
           // Silence or empty utterance
+          console.log('[STT Client] Empty transcript received, returning to LISTENING');
           setStatus(SESSION_STATES.LISTENING);
           return;
         }
@@ -503,17 +532,14 @@ export function useVoiceSession() {
           ['thanks for watching', 'thank you for watching', 'subtitles by', 'viewers like you', 'subscribe to my channel', 'amara.org'].some((h) => clean.includes(h));
 
         if (!clean || isHallucination) {
+          console.log(`[STT Client] Filtered hallucination: "${normalizedTranscript}"`);
           setStatus(SESSION_STATES.LISTENING);
           return;
         }
 
-        // Fix Whisper acoustic misclassification: if lone 'y' or 'y.' is transcribed when saying "Hey"
-        if (clean === 'y') {
-          normalizedTranscript = 'Hey';
-        }
-
         // Normalize developer terms, frameworks, and accent misrecognitions
         normalizedTranscript = normalizeTechTerms(normalizedTranscript);
+        console.log(`[STT Client Final] Normalized Transcript: "${normalizedTranscript}"`);
 
         // Ordinary speech utterance -> Start new turn with detected language
         startTurnWithText(normalizedTranscript, 'audio', result?.language);
@@ -549,9 +575,11 @@ export function useVoiceSession() {
   });
 
   // Keep VAD updated when assistant is actively speaking through speakers
+  const { setPlaybackActive } = microphone;
   useEffect(() => {
-    microphone.setPlaybackActive(status === SESSION_STATES.SPEAKING);
-  }, [status, microphone]);
+    const isSpeaking = status === SESSION_STATES.SPEAKING || Boolean(ttsPlayerRef.current?.isSpeaking);
+    setPlaybackActive(isSpeaking);
+  }, [status, setPlaybackActive]);
 
   /**
    * Toggle Mute
@@ -731,6 +759,9 @@ export function useVoiceSession() {
     // Handle server status updates
     const unsubStatus = socketClient.on('status', (data) => {
       if (data.state && SESSION_STATES[data.state]) {
+        if (data.state === SESSION_STATES.LISTENING && ttsPlayerRef.current?.isSpeaking) {
+          return;
+        }
         setStatus(data.state);
       }
     });

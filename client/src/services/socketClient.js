@@ -250,7 +250,7 @@ export class SocketClient {
       type: 'interrupt',
       turnId,
     };
-    if (typeof lastSpokenSegmentIndex === 'number' && lastSpokenSegmentIndex >= 0) {
+    if (typeof lastSpokenSegmentIndex === 'number') {
       payload.lastSpokenSegmentIndex = lastSpokenSegmentIndex;
     }
     return this.send(payload);
