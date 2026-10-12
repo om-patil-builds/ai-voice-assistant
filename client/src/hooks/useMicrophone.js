@@ -14,8 +14,8 @@ import { VoiceActivityDetector } from '../audio/vad.js';
 export function useMicrophone({
   silenceTimeoutMs = 700,
   speechThreshold = 0.020,
-  playbackSpeechThreshold = 0.060,
-  playbackMinSpeechDurationMs = 180,
+  playbackSpeechThreshold = 0.035,
+  playbackMinSpeechDurationMs = 100,
   onSpeechStart,
   onUtteranceRecorded,
   onError,
@@ -53,6 +53,7 @@ export function useMicrophone({
    * Handle speech start from VAD (immediate barge-in)
    */
   const handleVADSpeechStart = useCallback(() => {
+    console.log('[useMicrophone Trace] handleVADSpeechStart triggered (Barge-in callback invoked)');
     isSpeechActiveRef.current = true;
     setIsRecording(true);
 

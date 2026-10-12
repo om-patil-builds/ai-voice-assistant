@@ -313,6 +313,9 @@ export class TTSPlayer {
    * Play the next segment in the queue
    */
   _playNext() {
+    console.log(
+      `[TTSPlayer Trace] _playNext | queueLength=${this.queue.length} | isSpeaking=${this.isSpeaking} | turnId=${this.currentTurnId}`
+    );
     if (this.queue.length === 0) {
       this.isSpeaking = false;
       this.currentSegment = null;
@@ -499,6 +502,12 @@ export class TTSPlayer {
    * @returns {{ sourceTurnId: string|null, lastSpokenSegmentIndex: number, interruptedSegment: Object|null }}
    */
   cancel() {
+    const prevQueueLen = this.queue.length;
+    const prevTurnId = this.currentTurnId;
+    const wasSpeaking = this.isSpeaking;
+    console.log(
+      `[TTSPlayer Trace] cancel() called | turnId=${prevTurnId} | wasSpeaking=${wasSpeaking} | queueLength=${prevQueueLen} | lastSpokenIndex=${this.lastConfirmedSegmentIndex}`
+    );
     this.cancelled = true;
     this.isSpeaking = false;
     this.queue = [];
