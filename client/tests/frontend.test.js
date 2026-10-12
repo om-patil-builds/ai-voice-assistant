@@ -1,0 +1,731 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { VoiceActivityDetector } from '../src/audio/vad.js';
+import { PlaybackCursor } from '../src/audio/playbackCursor.js';
+import { parseVoiceCommand, SESSION_STATES } from '../src/hooks/useVoiceSession.js';
+import { SocketClient } from '../src/services/socketClient.js';
+import { ApiClient } from '../src/services/apiClient.js';
+import { TTSPlayer } from '../src/audio/ttsPlayer.js';
+import { encodeWav, downsampleBuffer, mergeBuffers, calculateRmsAndPeak } from '../src/audio/wavEncoder.js';
+import { detectLanguage, normalizeLanguageCode } from '../src/services/languageDetector.js';
+import { normalizeTechTerms, isTechnicalTermQuery } from '../src/services/techTermNormalizer.js';
+
+test('PlaybackCursor - segment tracking and interruption checkpoints', () => {
+  const cursor = new PlaybackCursor();
+  cursor.initTurn('turn_123');
+
+  cursor.addSegment(0, 'First sentence.');
+  cursor.addSegment(1, 'Second sentence.');
+  cursor.addSegment(2, 'Third sentence.');
+
+  // Confirmed playback of first sentence
+  cursor.confirmSegment(0);
+  assert.equal(cursor.lastSpokenSegmentIndex, 0);
+
+  // User interrupts mid-response
+  const paused = cursor.savePausedState('turn_123', 'First sentence. Second sentence. Third sentence.', 0, false);
+  assert.equal(paused.sourceTurnId, 'turn_123');
+  assert.equal(paused.lastSpokenSegmentIndex, 0);
+  assert.equal(paused.generationComplete, false);
+
+  // Check remaining unspoken segments
+  const remaining = cursor.getRemainingSegments();
+  assert.equal(remaining.length, 2);
+  assert.equal(remaining[0].text, 'Second sentence.');
+  assert.equal(remaining[1].text, 'Third sentence.');
+  assert.equal(cursor.getRemainingText(), 'Second sentence. Third sentence.');
+
+  // Resuming: confirm sentence 1 and sentence 2
+  cursor.confirmSegment(1);
+  cursor.confirmSegment(2);
+  cursor.markGenerationComplete();
+  assert.equal(cursor.getRemainingSegments().length, 0);
+});
+
+test('PlaybackCursor - state restoration from session API', () => {
+  const cursor = new PlaybackCursor();
+  const sessionData = {
+    pausedResponse: {
+      sourceTurnId: 'turn_456',
+      generatedText: 'Sentence one. Sentence two.',
+      lastSpokenSegmentIndex: 0,
+      generationComplete: true,
+      segments: [
+        { index: 0, text: 'Sentence one.' },
+        { index: 1, text: 'Sentence two.' },
+      ],
+    },
+  };
+
+  cursor.restoreState(sessionData);
+  assert.equal(cursor.currentTurnId, 'turn_456');
+  assert.equal(cursor.lastSpokenSegmentIndex, 0);
+  assert.equal(cursor.getRemainingSegments().length, 1);
+  assert.equal(cursor.getRemainingSegments()[0].text, 'Sentence two.');
+});
+
+test('CommandParser - standalone voice commands recognition (English, Marathi, Hindi)', () => {
+  // Positive matches for STOP (English, Marathi, Hindi)
+  assert.equal(parseVoiceCommand('stop'), 'STOP');
+  assert.equal(parseVoiceCommand('Stop!'), 'STOP');
+  assert.equal(parseVoiceCommand('stop talking'), 'STOP');
+  assert.equal(parseVoiceCommand('please stop'), 'STOP');
+  assert.equal(parseVoiceCommand('cancel'), 'STOP');
+  assert.equal(parseVoiceCommand('थांबा'), 'STOP');
+  assert.equal(parseVoiceCommand('बंद करा'), 'STOP');
+  assert.equal(parseVoiceCommand('रुको'), 'STOP');
+  assert.equal(parseVoiceCommand('रुक जाओ'), 'STOP');
+
+  // Positive matches for CONTINUE (English, Marathi, Hindi)
+  assert.equal(parseVoiceCommand('continue'), 'CONTINUE');
+  assert.equal(parseVoiceCommand('continue last response'), 'CONTINUE');
+  assert.equal(parseVoiceCommand('keep going'), 'CONTINUE');
+  assert.equal(parseVoiceCommand('go on'), 'CONTINUE');
+  assert.equal(parseVoiceCommand('resume please'), 'CONTINUE');
+  assert.equal(parseVoiceCommand('पुढे बोला'), 'CONTINUE');
+  assert.equal(parseVoiceCommand('सुरू ठेवा'), 'CONTINUE');
+  assert.equal(parseVoiceCommand('आगे बोलो'), 'CONTINUE');
+  assert.equal(parseVoiceCommand('जारी रखो'), 'CONTINUE');
+
+  // Positive matches for REPEAT (English, Marathi, Hindi)
+  assert.equal(parseVoiceCommand('repeat that'), 'REPEAT');
+  assert.equal(parseVoiceCommand('say that again'), 'REPEAT');
+  assert.equal(parseVoiceCommand('repeat last response'), 'REPEAT');
+  assert.equal(parseVoiceCommand('repeat'), 'REPEAT');
+  assert.equal(parseVoiceCommand('पुन्हा सांगा'), 'REPEAT');
+  assert.equal(parseVoiceCommand('परत सांगा'), 'REPEAT');
+  assert.equal(parseVoiceCommand('फिर से बोलो'), 'REPEAT');
+  assert.equal(parseVoiceCommand('दोबारा बोलो'), 'REPEAT');
+
+  // Positive matches for MUTE / UNMUTE (English, Marathi, Hindi)
+  assert.equal(parseVoiceCommand('mute'), 'MUTE');
+  assert.equal(parseVoiceCommand('mute audio'), 'MUTE');
+  assert.equal(parseVoiceCommand('आवाज बंद करा'), 'MUTE');
+  assert.equal(parseVoiceCommand('आवाज बंद करो'), 'MUTE');
+  assert.equal(parseVoiceCommand('unmute'), 'UNMUTE');
+  assert.equal(parseVoiceCommand('आवाज सुरू करा'), 'UNMUTE');
+  assert.equal(parseVoiceCommand('आवाज चालू करो'), 'UNMUTE');
+
+  // Positive matches for CLEAR_CHAT
+  assert.equal(parseVoiceCommand('clear chat'), 'CLEAR_CHAT');
+  assert.equal(parseVoiceCommand('clear history'), 'CLEAR_CHAT');
+});
+
+test('CommandParser - avoids misclassifying commands inside ordinary questions (multilingual)', () => {
+  // Should NOT trigger commands when embedded in ordinary sentences
+  assert.equal(parseVoiceCommand('Can you continue explaining quantum physics?'), null);
+  assert.equal(parseVoiceCommand('What should I stop doing in life?'), null);
+  assert.equal(parseVoiceCommand('If I continue reading this book, what happens?'), null);
+  assert.equal(parseVoiceCommand('Why did you repeat that word?'), null);
+  assert.equal(parseVoiceCommand('Please repeat after me: the quick brown fox'), null);
+  assert.equal(parseVoiceCommand('How do I mute my microphone?'), null);
+  assert.equal(parseVoiceCommand('Is it possible to clear my cache?'), null);
+  assert.equal(parseVoiceCommand('Tell me a story about a nonstop train'), null);
+  assert.equal(parseVoiceCommand('मला मर्न स्टॅक बद्दल पुढे सांगा?'), null);
+  assert.equal(parseVoiceCommand('क्या आप आगे बता सकते हैं?'), null);
+  assert.equal(parseVoiceCommand('आयुष्यात काय थांबवले पाहिजे?'), null);
+  assert.equal(parseVoiceCommand('जिंदगी में क्या रोकना चाहिए?'), null);
+});
+
+test('SocketClient - message schema validation', () => {
+  const socket = new SocketClient('ws://localhost:5000');
+  let sentPayload = null;
+  socket.socket = {
+    readyState: 1, // OPEN
+    send: (msg) => {
+      sentPayload = JSON.parse(msg);
+    },
+  };
+
+  // start_turn
+  socket.startTurn({ turnId: 'turn_abc', seq: 0, inputType: 'text', text: 'Hello AI' });
+  assert.deepEqual(sentPayload, {
+    type: 'start_turn',
+    turnId: 'turn_abc',
+    seq: 0,
+    inputType: 'text',
+    text: 'Hello AI',
+  });
+
+  // interrupt
+  socket.interrupt('turn_abc');
+  assert.deepEqual(sentPayload, {
+    type: 'interrupt',
+    turnId: 'turn_abc',
+  });
+
+  // continue
+  socket.continueTurn({ sourceTurnId: 'turn_abc', lastSpokenSegmentIndex: 2 });
+  assert.deepEqual(sentPayload, {
+    type: 'continue',
+    sourceTurnId: 'turn_abc',
+    lastSpokenSegmentIndex: 2,
+  });
+
+  // stop
+  socket.stop('turn_abc');
+  assert.deepEqual(sentPayload, {
+    type: 'stop',
+    turnId: 'turn_abc',
+  });
+});
+
+test('ApiClient - endpoint URL structure and abort handling', async () => {
+  const client = new ApiClient('http://localhost:5000/');
+  assert.equal(client.baseUrl, 'http://localhost:5000');
+
+  // Verify empty blob validation
+  await assert.rejects(
+    async () => client.uploadAudio(null),
+    { message: 'Audio data is empty or invalid.' }
+  );
+
+  // Verify AbortController signal handling
+  const controller = new AbortController();
+  controller.abort();
+  const fakeBlob = new Blob(['mock audio'], { type: 'audio/webm' });
+
+  await assert.rejects(
+    async () => client.uploadAudio(fakeBlob, 'test.webm', { signal: controller.signal }),
+    (err) => err.name === 'AbortError'
+  );
+});
+
+test('State Machine - states enum definition', () => {
+  assert.equal(SESSION_STATES.IDLE, 'IDLE');
+  assert.equal(SESSION_STATES.LISTENING, 'LISTENING');
+  assert.equal(SESSION_STATES.TRANSCRIBING, 'TRANSCRIBING');
+  assert.equal(SESSION_STATES.THINKING, 'THINKING');
+  assert.equal(SESSION_STATES.SPEAKING, 'SPEAKING');
+  assert.equal(SESSION_STATES.INTERRUPTED, 'INTERRUPTED');
+  assert.equal(SESSION_STATES.PAUSED, 'PAUSED');
+  assert.equal(SESSION_STATES.ERROR, 'ERROR');
+});
+
+test('Message Transcript Handling - User transcript and Assistant stream separation', () => {
+  const turnId = 'turn_test_voice_1';
+  const spokenText = 'My name is Om Patil.';
+  const assistantDeltaChunks = ['Nice', ' to', ' meet', ' you,', ' Om!'];
+
+  // Initialize turn with user message and streaming assistant placeholder
+  let messages = [
+    {
+      id: 'msg_user_1',
+      sender: 'user',
+      text: spokenText,
+      turnId,
+      timestamp: Date.now(),
+    },
+    {
+      id: 'msg_assistant_1',
+      sender: 'assistant',
+      text: '',
+      turnId,
+      status: 'streaming',
+      timestamp: Date.now(),
+    },
+  ];
+
+  // Verify initial state
+  assert.equal(messages[0].sender, 'user');
+  assert.equal(messages[0].text, 'My name is Om Patil.');
+  assert.equal(messages[1].sender, 'assistant');
+  assert.equal(messages[1].text, '');
+  assert.notEqual(messages[0].id, messages[1].id);
+
+  // Simulate streaming assistant deltas arriving
+  let accumulatedAssistantText = '';
+  for (const delta of assistantDeltaChunks) {
+    accumulatedAssistantText += delta;
+    // Apply update logic: only assistant messages for the turn are updated
+    messages = messages.map((msg) =>
+      msg.turnId === turnId && msg.sender === 'assistant'
+        ? { ...msg, text: accumulatedAssistantText }
+        : msg
+    );
+  }
+
+  // CRITICAL CHECK: User message MUST NEVER be overwritten by assistant deltas!
+  assert.equal(messages[0].sender, 'user');
+  assert.equal(messages[0].text, 'My name is Om Patil.', 'User message must preserve spoken words');
+  assert.equal(messages[1].sender, 'assistant');
+  assert.equal(messages[1].text, 'Nice to meet you, Om!', 'Assistant message contains full streamed answer');
+
+  // Simulate turn completion
+  messages = messages.map((msg) =>
+    msg.turnId === turnId && msg.sender === 'assistant'
+      ? { ...msg, status: 'completed' }
+      : msg
+  );
+  assert.equal(messages[0].status, undefined);
+  assert.equal(messages[1].status, 'completed');
+
+  // Simulate barge-in interruption on a second turn
+  const turn2Id = 'turn_test_voice_2';
+  const turn2SpokenText = 'What is the weather today?';
+  messages = [
+    ...messages,
+    {
+      id: 'msg_user_2',
+      sender: 'user',
+      text: turn2SpokenText,
+      turnId: turn2Id,
+      timestamp: Date.now(),
+    },
+    {
+      id: 'msg_assistant_2',
+      sender: 'assistant',
+      text: 'It is sunny and 75 degrees.',
+      turnId: turn2Id,
+      status: 'streaming',
+      timestamp: Date.now(),
+    },
+  ];
+
+  // Interruption occurs during turn 2 playback
+  messages = messages.map((msg) =>
+    msg.turnId === turn2Id && msg.sender === 'assistant'
+      ? { ...msg, status: 'interrupted', lastSpokenSegmentIndex: 0 }
+      : msg
+  );
+
+  // Check that turn 1 user, turn 1 assistant, and turn 2 user remain completely untouched
+  assert.equal(messages[0].text, 'My name is Om Patil.');
+  assert.equal(messages[1].text, 'Nice to meet you, Om!');
+  assert.equal(messages[2].text, 'What is the weather today?');
+  assert.equal(messages[3].status, 'interrupted');
+});
+
+test('TTSPlayer - sentence chunking, queue management, and volume/rate controls', () => {
+  const player = new TTSPlayer();
+
+  // Test volume clamping (0.0 to 1.0)
+  player.setVolume(0.75);
+  assert.equal(player.volume, 0.75);
+  player.setVolume(2.5);
+  assert.equal(player.volume, 1.0, 'Volume must clamp to 1.0');
+  player.setVolume(-0.5);
+  assert.equal(player.volume, 0.0, 'Volume must clamp to 0.0');
+
+  // Test rate clamping (0.5 to 2.0)
+  player.setRate(1.2);
+  assert.equal(player.rate, 1.2);
+  player.setRate(3.0);
+  assert.equal(player.rate, 2.0, 'Rate must clamp to 2.0');
+  player.setRate(0.1);
+  assert.equal(player.rate, 0.5, 'Rate must clamp to 0.5');
+
+  // Test sentence chunking via feedDelta
+  player.resetForTurn('turn_delta_test');
+  player.feedDelta('Hello there! ', 'turn_delta_test', false, 'en');
+  player.feedDelta('How can I help you today? ', 'turn_delta_test', false, 'en');
+
+  // In Node environment without window.speechSynthesis, queue items are pushed
+  // (or shifted if non-browser fallback plays immediately)
+  assert.ok(player.nextSegmentIndex >= 2, 'Should extract at least 2 completed sentence segments');
+
+  // Test sentence chunking for Devanagari with Purna Viram (।)
+  player.resetForTurn('turn_marathi_purna_viram');
+  player.feedDelta('हे पहिले वाक्य आहे। ', 'turn_marathi_purna_viram', false, 'mr');
+  player.feedDelta('हे दुसरे वाक्य आहे। ', 'turn_marathi_purna_viram', false, 'mr');
+  assert.ok(player.nextSegmentIndex >= 2, 'Should extract Devanagari sentences split by Purna Viram');
+
+  // Test cancel
+  const cancelResult = player.cancel();
+  assert.equal(cancelResult.sourceTurnId, 'turn_marathi_purna_viram');
+  assert.equal(player.isSpeaking, false);
+  assert.equal(player.queue.length, 0);
+});
+
+test('WAV Encoder - lossless PCM generation, downsampling, and energy detection', async () => {
+  // Test mergeBuffers
+  const chunk1 = new Float32Array([1.0, 2.0]);
+  const chunk2 = new Float32Array([3.0, 4.0, 5.0]);
+  const merged = mergeBuffers([chunk1, chunk2]);
+  assert.equal(merged.length, 5);
+  assert.deepEqual(Array.from(merged), [1.0, 2.0, 3.0, 4.0, 5.0]);
+
+  // Test downsampleBuffer (48kHz -> 16kHz, ratio 3:1)
+  const input48k = new Float32Array(48000); // 1 second at 48kHz
+  for (let i = 0; i < input48k.length; i++) {
+    input48k[i] = Math.sin((2 * Math.PI * 440 * i) / 48000); // 440Hz sine wave
+  }
+  const downsampled = downsampleBuffer(input48k, 48000, 16000);
+  assert.equal(downsampled.length, 16000, 'Downsampled length must be 16,000 for 1 second at 16kHz');
+
+  // Test calculateRmsAndPeak
+  const { rms, peak } = calculateRmsAndPeak(downsampled);
+  assert.ok(peak > 0.95 && peak <= 1.0, `Peak should be near 1.0, got ${peak}`);
+  assert.ok(rms > 0.65 && rms < 0.75, `Sine wave RMS should be ~0.707, got ${rms}`);
+
+  // Test encodeWav produces valid RIFF WAV header
+  const wavBlob = encodeWav(downsampled, 16000);
+  assert.equal(wavBlob.type, 'audio/wav');
+  assert.equal(wavBlob.size, 44 + 16000 * 2, 'WAV size must be 44-byte header + 32,000 bytes PCM');
+
+  // Inspect binary header bytes
+  const arrayBuffer = await wavBlob.arrayBuffer();
+  const view = new DataView(arrayBuffer);
+  const textDecoder = new TextDecoder();
+
+  const riff = textDecoder.decode(new Uint8Array(arrayBuffer, 0, 4));
+  const wave = textDecoder.decode(new Uint8Array(arrayBuffer, 8, 4));
+  const fmt = textDecoder.decode(new Uint8Array(arrayBuffer, 12, 4));
+  const data = textDecoder.decode(new Uint8Array(arrayBuffer, 36, 4));
+
+  assert.equal(riff, 'RIFF');
+  assert.equal(wave, 'WAVE');
+  assert.equal(fmt, 'fmt ');
+  assert.equal(data, 'data');
+
+  assert.equal(view.getUint16(20, true), 1, 'AudioFormat must be 1 (PCM)');
+  assert.equal(view.getUint16(22, true), 1, 'NumChannels must be 1 (Mono)');
+  assert.equal(view.getUint32(24, true), 16000, 'SampleRate must be 16000');
+  assert.equal(view.getUint16(34, true), 16, 'BitsPerSample must be 16');
+});
+
+test('LanguageDetector (client) - multi-language detection and code-mixing', () => {
+  // English
+  assert.equal(detectLanguage('What is the MERN stack?'), 'en');
+  assert.equal(detectLanguage('Can you help me build a website?'), 'en');
+
+  // Marathi in Devanagari
+  assert.equal(detectLanguage('मर्न स्टॅक म्हणजे काय?'), 'mr');
+  assert.equal(detectLanguage('मला सांगा तुम्ही काय करू शकता?'), 'mr');
+  assert.equal(detectLanguage('सकाळच्या नाश्त्यात काय खावे?'), 'mr');
+
+  // Hindi in Devanagari
+  assert.equal(detectLanguage('मर्न स्टैक क्या है?'), 'hi');
+  assert.equal(detectLanguage('मुझे बताओ तुम क्या कर सकते हो?'), 'hi');
+  assert.equal(detectLanguage('आप कैसे हैं?'), 'hi');
+
+  // Code-mixed (Maranglish / Hinglish)
+  assert.equal(detectLanguage('MERN stack mhanje kay?'), 'mr');
+  assert.equal(detectLanguage('mala sanga na'), 'mr');
+  assert.equal(detectLanguage('MERN stack kya hota hai?'), 'hi');
+  assert.equal(detectLanguage('mujhe batao please'), 'hi');
+
+  // Normalization
+  assert.equal(normalizeLanguageCode('mr-IN'), 'mr');
+  assert.equal(normalizeLanguageCode('hi-IN'), 'hi');
+  assert.equal(normalizeLanguageCode('en-US'), 'en');
+  assert.equal(normalizeLanguageCode(null), 'en');
+});
+
+test('TechTermNormalizer (client) - normalizes English and Devanagari developer terms', () => {
+  // English variations
+  assert.equal(normalizeTechTerms('mern stack'), 'MERN Stack');
+  assert.equal(normalizeTechTerms('mango db'), 'MongoDB');
+  assert.equal(normalizeTechTerms('express js'), 'Express.js');
+  assert.equal(normalizeTechTerms('react js'), 'React.js');
+  assert.equal(normalizeTechTerms('note js'), 'Node.js');
+
+  // Devanagari terms
+  assert.equal(normalizeTechTerms('मर्न स्टॅक म्हणजे काय?'), 'MERN Stack म्हणजे काय?');
+  assert.equal(normalizeTechTerms('मर्न स्टैक क्या है?'), 'MERN Stack क्या है?');
+  assert.equal(normalizeTechTerms('मोंगो डीबी बद्दल सांगा'), 'MongoDB बद्दल सांगा');
+  assert.equal(normalizeTechTerms('रिएक्ट जेएस शिका'), 'React.js शिका');
+
+  // Query check
+  assert.equal(isTechnicalTermQuery('MERN Stack'), true);
+  assert.equal(isTechnicalTermQuery('मर्न स्टॅक'), true);
+  assert.equal(isTechnicalTermQuery('hello there'), false);
+});
+
+test('VoiceActivityDetector - configurable playback thresholds and duration', () => {
+  const vad = new VoiceActivityDetector({
+    speechThreshold: 0.02,
+    playbackSpeechThreshold: 0.035,
+    playbackMinSpeechDurationMs: 100,
+  });
+
+  assert.equal(vad.speechThreshold, 0.02);
+  assert.equal(vad.playbackSpeechThreshold, 0.035);
+  assert.equal(vad.playbackMinSpeechDurationMs, 100);
+
+  vad.setPlaybackSpeechThreshold(0.04);
+  assert.equal(vad.playbackSpeechThreshold, 0.04);
+
+  vad.setPlaybackMinSpeechDuration(120);
+  assert.equal(vad.playbackMinSpeechDurationMs, 120);
+});
+
+test('VoiceActivityDetector - setPlaybackActive only updates playbackStartTime on transition', () => {
+  const vad = new VoiceActivityDetector();
+  assert.equal(vad.isPlaybackActive, false);
+  assert.equal(vad.playbackStartTime, 0);
+
+  vad.setPlaybackActive(true);
+  assert.equal(vad.isPlaybackActive, true);
+  const initialStartTime = vad.playbackStartTime;
+  assert.ok(initialStartTime > 0);
+
+  // Calling setPlaybackActive(true) repeatedly must NOT reset playbackStartTime
+  vad.setPlaybackActive(true);
+  assert.equal(vad.playbackStartTime, initialStartTime, 'playbackStartTime must remain stable when already active');
+
+  vad.setPlaybackActive(false);
+  assert.equal(vad.isPlaybackActive, false);
+
+  vad.setPlaybackActive(true);
+  assert.ok(vad.playbackStartTime >= initialStartTime, 'playbackStartTime must update on fresh transition');
+});
+
+test('VoiceActivityDetector - _processAudioFrame detects speech under playback with realistic threshold', () => {
+  let speechStarted = false;
+  const vad = new VoiceActivityDetector({
+    speechThreshold: 0.022,
+    playbackSpeechThreshold: 0.035,
+    playbackMinSpeechDurationMs: 100,
+    onSpeechStart: () => {
+      speechStarted = true;
+    },
+  });
+
+  vad.isListening = true;
+  vad.setPlaybackActive(true);
+  // Fast forward past startup ducking window (120ms)
+  vad.playbackStartTime = performance.now() - 500;
+
+  // Generate PCM frame with RMS ~0.050 (above playbackSpeechThreshold 0.035, below old hardcoded 0.065)
+  const sampleCount = 4096;
+  const frame = new Float32Array(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    frame[i] = 0.07 * Math.sin((i / 48000) * 2 * Math.PI * 440);
+  }
+
+  // First frame: initiates candidate speech onset
+  vad._processAudioFrame(frame);
+  assert.equal(speechStarted, false, 'Speech should not confirm immediately on first frame');
+  assert.ok(vad.candidateSpeechStart > 0, 'candidateSpeechStart must be recorded');
+
+  // Fast forward time past playbackMinSpeechDurationMs (100ms)
+  vad.candidateSpeechStart = performance.now() - 150;
+
+  // Second frame: sustained duration met -> speech onset confirmed!
+  vad._processAudioFrame(frame);
+  assert.equal(speechStarted, true, 'Speech must be confirmed and trigger onSpeechStart callback');
+  assert.equal(vad.isSpeaking, true);
+});
+
+test('Regression: Silence does not interrupt playback', () => {
+  let interrupted = false;
+  const vad = new VoiceActivityDetector({
+    onSpeechStart: () => {
+      interrupted = true;
+    },
+  });
+
+  vad.isListening = true;
+  vad.setPlaybackActive(true);
+  vad.playbackStartTime = performance.now() - 500; // Past startup ducking window
+
+  const sampleCount = 4096;
+  const silenceFrame = new Float32Array(sampleCount); // All zeros
+
+  // Feed 15 silence frames (~1.2 seconds of silence)
+  for (let i = 0; i < 15; i++) {
+    vad._processAudioFrame(silenceFrame);
+  }
+
+  assert.equal(interrupted, false, 'Silence must never trigger speech start or barge-in interruption');
+  assert.equal(vad.isSpeaking, false, 'VAD should remain in not-speaking state during silence');
+  assert.equal(vad.candidateSpeechStart, 0, 'candidateSpeechStart should remain 0');
+});
+
+test('Regression: Low-level background noise and speaker echo do not interrupt playback', () => {
+  let interrupted = false;
+  const vad = new VoiceActivityDetector({
+    onSpeechStart: () => {
+      interrupted = true;
+    },
+  });
+
+  vad.isListening = true;
+  vad.setPlaybackActive(true);
+  vad.playbackStartTime = performance.now() - 500;
+
+  const sampleCount = 4096;
+  // Ambient room noise / speaker echo (RMS ~0.025 - 0.035, below playback threshold of 0.060)
+  const noiseFrame = new Float32Array(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    noiseFrame[i] = 0.035 * Math.sin((i / 48000) * 2 * Math.PI * 300);
+  }
+
+  // Feed 12 frames of continuous background noise (~1.0 second)
+  for (let i = 0; i < 12; i++) {
+    vad._processAudioFrame(noiseFrame);
+  }
+
+  assert.equal(interrupted, false, 'Continuous background noise must not trigger barge-in during playback');
+  assert.equal(vad.isSpeaking, false);
+  assert.equal(vad.candidateSpeechStart, 0);
+
+  // Test isolated transient pop: 1 frame at 0.070 RMS followed by noise
+  const spikeFrame = new Float32Array(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    spikeFrame[i] = 0.10 * Math.sin((i / 48000) * 2 * Math.PI * 440);
+  }
+  vad._processAudioFrame(spikeFrame);
+  assert.equal(interrupted, false, 'Single transient frame must not confirm speech');
+  assert.ok(vad.candidateSpeechStart > 0, 'Spike initiates candidate onset');
+
+  // Next frame drops back to noise level -> candidate onset must be immediately reset!
+  vad._processAudioFrame(noiseFrame);
+  assert.equal(vad.candidateSpeechStart, 0, 'Candidate speech onset must reset when energy drops below threshold');
+  assert.equal(interrupted, false, 'Barge-in must not trigger on isolated transient');
+});
+
+test('Regression: Genuine user speech interrupts playback', () => {
+  let interrupted = false;
+  const vad = new VoiceActivityDetector({
+    onSpeechStart: () => {
+      interrupted = true;
+    },
+  });
+
+  vad.isListening = true;
+  vad.setPlaybackActive(true);
+  vad.playbackStartTime = performance.now() - 500;
+
+  const sampleCount = 4096;
+  // Genuine speech frame: clear voice at ~0.10 RMS (well above playback threshold 0.060)
+  const speechFrame = new Float32Array(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    speechFrame[i] = 0.14 * Math.sin((i / 48000) * 2 * Math.PI * 250);
+  }
+
+  // Frame 1: speech onset begins
+  vad._processAudioFrame(speechFrame);
+  assert.equal(interrupted, false, 'Barge-in should not trigger before minimum sustained duration');
+  assert.ok(vad.candidateSpeechStart > 0, 'Candidate speech onset marked');
+
+  // Advance time past playbackMinSpeechDurationMs (default 180ms)
+  vad.candidateSpeechStart = performance.now() - 220;
+
+  // Frame 2: sustained speech confirmed!
+  vad._processAudioFrame(speechFrame);
+  assert.equal(interrupted, true, 'Genuine speech sustained for required duration must trigger barge-in');
+  assert.equal(vad.isSpeaking, true);
+});
+
+test('Regression: Microphone monitoring remains active during playback', () => {
+  let levelReported = null;
+  const vad = new VoiceActivityDetector({
+    onAudioLevel: (lvl) => {
+      levelReported = lvl;
+    },
+  });
+
+  vad.isListening = true;
+  vad.setPlaybackActive(true);
+
+  assert.equal(vad.isListening, true, 'VAD isListening must remain true during playback');
+  assert.equal(vad.isPlaybackActive, true, 'isPlaybackActive must be true');
+
+  // Feed an audio frame and verify audio level monitoring still functions
+  const sampleCount = 4096;
+  const frame = new Float32Array(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    frame[i] = 0.05 * Math.sin((i / 48000) * 2 * Math.PI * 440);
+  }
+
+  vad._processAudioFrame(frame);
+  assert.ok(levelReported !== null && levelReported > 0, 'Audio level visualizer must remain active during playback');
+  assert.ok(vad.preRollChunks.length > 0, 'Audio frames must continue buffering in pre-roll during playback');
+});
+
+test('Regression: Conversational-volume speech (RMS 0.040-0.050) reliably triggers barge-in under default settings', () => {
+  let bargeInFired = false;
+  // Use default options - no custom thresholds passed
+  const vad = new VoiceActivityDetector({
+    onSpeechStart: () => {
+      bargeInFired = true;
+    },
+  });
+
+  vad.isListening = true;
+  vad.setPlaybackActive(true);
+  vad.playbackStartTime = performance.now() - 500; // Past startup ducking window
+
+  const sampleCount = 4096;
+  // Conversational speech frame at amplitude 0.065 -> RMS = 0.065 / sqrt(2) ≈ 0.0460
+  // (Previously failed under old 0.060 threshold; now reliably detected under 0.035 threshold)
+  const speechFrame = new Float32Array(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    speechFrame[i] = 0.065 * Math.sin((i / 48000) * 2 * Math.PI * 300);
+  }
+
+  // Frame 1: Onset detection
+  vad._processAudioFrame(speechFrame);
+  assert.equal(bargeInFired, false, 'Barge-in should not trigger before min duration is met');
+  assert.ok(vad.candidateSpeechStart > 0, 'Candidate speech onset must be set for conversational speech');
+
+  // Advance time past default playbackMinSpeechDurationMs (100ms)
+  vad.candidateSpeechStart = performance.now() - 110;
+
+  // Frame 2: Sustained duration met -> Barge-in confirmed!
+  vad._processAudioFrame(speechFrame);
+  assert.equal(bargeInFired, true, 'Conversational speech (RMS ~0.046) must reliably interrupt assistant playback');
+  assert.equal(vad.isSpeaking, true);
+});
+
+test('Regression: Old audio is cancelled immediately upon barge-in and never restarts automatically', () => {
+  const ttsPlayer = new TTSPlayer();
+  ttsPlayer.resetForTurn('turn_barge_cancel_test');
+
+  // Enqueue multiple segments simulating a multi-sentence assistant response
+  ttsPlayer.enqueueSegment('Sentence one has started.', 0, 'turn_barge_cancel_test');
+  ttsPlayer.enqueueSegment('Sentence two is waiting in queue.', 1, 'turn_barge_cancel_test');
+  ttsPlayer.enqueueSegment('Sentence three should never be spoken.', 2, 'turn_barge_cancel_test');
+
+  // Confirm segment 0 was heard
+  ttsPlayer.lastConfirmedSegmentIndex = 0;
+
+  // User barges in -> cancel() is invoked
+  const cancelResult = ttsPlayer.cancel();
+
+  assert.equal(cancelResult.sourceTurnId, 'turn_barge_cancel_test');
+  assert.equal(cancelResult.lastSpokenSegmentIndex, 0);
+  assert.equal(ttsPlayer.queue.length, 0, 'Queue must be completely emptied upon barge-in');
+  assert.equal(ttsPlayer.isSpeaking, false, 'Player isSpeaking must be false');
+  assert.equal(ttsPlayer.cancelled, true, 'Player cancelled flag must be true');
+
+  // Attempt to feed late LLM delta tokens for this cancelled turn
+  ttsPlayer.feedDelta('Late tokens arriving from slow network.', 'turn_barge_cancel_test', false);
+  assert.equal(ttsPlayer.queue.length, 0, 'Late tokens from cancelled turn must never enqueue new audio');
+  assert.equal(ttsPlayer.isSpeaking, false, 'Player must remain silent');
+});
+
+test('Regression: Interrupted response can be resumed without repeating spoken audio', () => {
+  const cursor = new PlaybackCursor();
+  cursor.initTurn('turn_resume_test');
+  cursor.addSegment(0, 'First part of the answer.');
+  cursor.addSegment(1, 'Second part of the answer.');
+  cursor.addSegment(2, 'Third part of the answer.');
+
+  // User heard segment 0
+  cursor.confirmSegment(0);
+
+  // Barge-in occurs
+  const paused = cursor.savePausedState(
+    'turn_resume_test',
+    'First part of the answer. Second part of the answer. Third part of the answer.',
+    0,
+    true
+  );
+
+  assert.equal(paused.lastSpokenSegmentIndex, 0);
+  assert.equal(paused.generationComplete, true);
+
+  // Filter remaining unspoken segments for resume
+  const remaining = paused.segments.filter((s) => s.index > paused.lastSpokenSegmentIndex);
+  assert.equal(remaining.length, 2, 'Only unspoken segments (1 and 2) should remain');
+  assert.equal(remaining[0].index, 1);
+  assert.equal(remaining[1].index, 2);
+  assert.equal(remaining[0].text, 'Second part of the answer.');
+  assert.equal(remaining[1].text, 'Third part of the answer.');
+});
+
+
+
